@@ -56,10 +56,14 @@ describe('Firestore Security Rules & Blueprint Integrity', () => {
     expect(rulesText).toContain('isValidId(');
   });
 
-  it('validates optional themePreference, preferredBookmaker, activeBookmaker, and bookmakerId fields', () => {
+  it('validates optional themePreference, preferredBookmaker, activeBookmaker, bookmakerId, feedSection, and Live/Other targets', () => {
     expect(rulesText).toContain("data.themePreference in ['dark', 'light']");
     expect(rulesText).toContain("data.preferredBookmaker in ['SPORTYBET_TZ', 'BETPAWA_TZ']");
     expect(rulesText).toContain("data.activeBookmaker in ['SPORTYBET_TZ', 'BETPAWA_TZ']");
     expect(rulesText).toContain("data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ']");
+    expect(rulesText).toContain("data.feedSection in ['UPCOMING', 'LIVE_FOOTBALL', 'OTHER_SPORTS']");
+    expect(rulesText).toContain('data.liveFootballTarget >= 10');
+    expect(rulesText).toContain('data.otherSportsTarget >= 10');
+    expect(rulesText).toContain('settledWonCount');
   });
 });

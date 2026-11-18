@@ -8,6 +8,7 @@ import { getBookmakerClient } from '../integrations/bookmakerRegistry.ts';
 import type {
   BookmakerId,
   DailyFactoryConfig,
+  FeedSection,
   GeneratedTicket,
   NormalizedMatch,
   OddsCategoryConfig,
@@ -19,6 +20,45 @@ import {
   isDisallowedDailyFeedSelection,
   sanitizeDailyFactoryMarkets,
 } from '../../src/utils/dailyFeedFilter.ts';
+
+export const NON_FOOTBALL_SPORT_IDS = [
+  'sr:sport:2',  // Basketball
+  'sr:sport:4',  // Ice Hockey
+  'sr:sport:23', // Volleyball
+  'sr:sport:6',  // Handball
+  'sr:sport:5',  // Tennis
+  'sr:sport:20', // Table Tennis
+  'sr:sport:21', // Cricket
+];
+
+export const MULTI_SPORT_SAFE_MARKET_IDS = '18,225,238,10,26,236,189,19,20,29';
+
+export const LIVE_AND_OTHER_FALLBACK_CATEGORIES: OddsCategoryConfig[] = [
+  {
+    id: 'cat_1_2',
+    label: '1.25–2.20',
+    minCombinedOdds: 1.25,
+    maxCombinedOdds: 2.2,
+    targetCombinedOdds: 1.65,
+    weight: 40,
+  },
+  {
+    id: 'cat_2_3',
+    label: '2.00–3.00',
+    minCombinedOdds: 2.0,
+    maxCombinedOdds: 3.0,
+    targetCombinedOdds: 2.45,
+    weight: 35,
+  },
+  {
+    id: 'cat_3_5',
+    label: '3.00–5.00',
+    minCombinedOdds: 3.0,
+    maxCombinedOdds: 5.0,
+    targetCombinedOdds: 3.85,
+    weight: 25,
+  },
+];
 
 export const DEFAULT_ODDS_CATEGORIES: OddsCategoryConfig[] = [
   {
@@ -189,13 +229,23 @@ export function resolveEffectiveMarketsForBookmaker(
 export function discoverEligibleSelections(
   matches: NormalizedMatch[],
   config: DailyFactoryConfig,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  options?: {
+    allowLive?: boolean;
+    allowBothLiveAndUpcoming?: boolean;
+    ignoreScheduleWindow?: boolean;
+    skipMarketFilter?: boolean;
+  }
 ): TicketSelectionRecord[] {
   const tz = config.timezone || 'Africa/Dar_es_Salaam';
   const { startDate, endDate } = resolveFactoryDateRange(config, nowMs);
   const minStartMinutes = parseHhMmToMinutes(config.windowStartTime, 0);
   const maxEndMinutes = parseHhMmToMinutes(config.windowEndTime, 23 * 60 + 59);
   const configuredBookmaker = normalizeBookmakerId(config.activeBookmaker);
+  const allowLive = Boolean(options?.allowLive);
+  const allowBothLiveAndUpcoming = Boolean(options?.allowBothLiveAndUpcoming);
+  const ignoreScheduleWindow = Boolean(options?.ignoreScheduleWindow || allowLive || allowBothLiveAndUpcoming);
+  const skipMarketFilter = Boolean(options?.skipMarketFilter);
 
   const leagueSet = new Set(
     (config.leagues || []).map((l) => l.trim().toLowerCase()).filter(Boolean)
@@ -211,21 +261,34 @@ export function discoverEligibleSelections(
 
   for (const match of matches) {
     if (!match || !match.eventId || !match.homeTeam || !match.awayTeam) continue;
-    if (match.isLive || match.estimateStartTime <= nowMs) continue;
-    if (match.statusCode !== 0 && match.statusCode !== 2) continue;
+    const matchIsLive = Boolean(match.isLive || match.statusCode === 1);
+    const matchEndedOrVoid = match.statusCode >= 3;
+    if (matchEndedOrVoid) continue;
 
-    const matchDateKey = getDateKeyInTimezone(match.estimateStartTime, tz);
-    if (startDate && matchDateKey < startDate) continue;
-    if (endDate && matchDateKey > endDate) continue;
-
-    const kickoffMin = getTimeMinutesInTimezone(match.estimateStartTime, tz);
-    if (minStartMinutes <= maxEndMinutes) {
-      if (kickoffMin < minStartMinutes || kickoffMin > maxEndMinutes) continue;
+    if (allowBothLiveAndUpcoming) {
+      // Allow active live matches or future scheduled matches
+      if (!matchIsLive && match.estimateStartTime <= nowMs) continue;
+    } else if (allowLive) {
+      if (!matchIsLive) continue;
     } else {
-      if (kickoffMin < minStartMinutes && kickoffMin > maxEndMinutes) continue;
+      if (matchIsLive || match.estimateStartTime <= nowMs) continue;
+      if (match.statusCode !== 0 && match.statusCode !== 2) continue;
     }
 
-    if (leagueSet.size > 0) {
+    if (!ignoreScheduleWindow) {
+      const matchDateKey = getDateKeyInTimezone(match.estimateStartTime, tz);
+      if (startDate && matchDateKey < startDate) continue;
+      if (endDate && matchDateKey > endDate) continue;
+
+      const kickoffMin = getTimeMinutesInTimezone(match.estimateStartTime, tz);
+      if (minStartMinutes <= maxEndMinutes) {
+        if (kickoffMin < minStartMinutes || kickoffMin > maxEndMinutes) continue;
+      } else {
+        if (kickoffMin < minStartMinutes && kickoffMin > maxEndMinutes) continue;
+      }
+    }
+
+    if (!skipMarketFilter && leagueSet.size > 0) {
       const idLow = match.leagueId.toLowerCase();
       const nameLow = match.leagueName.toLowerCase();
       const fullLow = `${match.country.toLowerCase()} - ${nameLow}`;
@@ -239,7 +302,7 @@ export function discoverEligibleSelections(
       if (isDisallowedDailyFeedMarket(market.marketId, market.desc || market.name)) {
         continue;
       }
-      if (!config.anyMarket && marketSet.size > 0 && !marketSet.has(market.marketId)) {
+      if (!skipMarketFilter && !config.anyMarket && marketSet.size > 0 && !marketSet.has(market.marketId)) {
         continue;
       }
 
@@ -278,6 +341,8 @@ export function discoverEligibleSelections(
           selectionKey,
           bookmakerId: matchBookmaker,
           bookmakerName: match.bookmakerName || matchBookmakerInfo.name,
+          sportId: match.sportId || 'sr:sport:1',
+          sportName: match.sportName || 'Football',
           eventId: match.eventId,
           homeTeam: match.homeTeam,
           awayTeam: match.awayTeam,
@@ -286,7 +351,7 @@ export function discoverEligibleSelections(
           country: match.country,
           estimateStartTime: match.estimateStartTime,
           matchStatus: match.matchStatus,
-          isLive: false,
+          isLive: matchIsLive,
           marketId: market.marketId,
           marketName: market.desc || market.name,
           specifier: market.specifier || '',
@@ -467,10 +532,13 @@ export function revalidateTicketSelectionsAgainstMatches(
   selections: TicketSelectionRecord[],
   matchLookup: Map<string, NormalizedMatch | null>,
   config: DailyFactoryConfig,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  options?: { allowLive?: boolean; allowBothLiveAndUpcoming?: boolean }
 ): { valid: boolean; refreshedSelections: TicketSelectionRecord[]; reason: string | null } {
   const seenEvents = new Set<string>();
   const refreshedSelections: TicketSelectionRecord[] = [];
+  const allowLive = Boolean(options?.allowLive);
+  const allowBothLiveAndUpcoming = Boolean(options?.allowBothLiveAndUpcoming);
 
   for (const sel of selections) {
     if (isDisallowedDailyFeedSelection(sel)) {
@@ -494,7 +562,32 @@ export function revalidateTicketSelectionsAgainstMatches(
       };
     }
 
-    if (liveMatch.isLive || liveMatch.estimateStartTime <= nowMs) {
+    const matchIsLive = Boolean(liveMatch.isLive || liveMatch.statusCode === 1);
+    if (liveMatch.statusCode >= 3) {
+      return {
+        valid: false,
+        refreshedSelections: [],
+        reason: `Match ${sel.homeTeam} vs ${sel.awayTeam} already ended or was voided`,
+      };
+    }
+
+    if (allowBothLiveAndUpcoming) {
+      if (!matchIsLive && liveMatch.estimateStartTime <= nowMs) {
+        return {
+          valid: false,
+          refreshedSelections: [],
+          reason: `Match ${sel.homeTeam} vs ${sel.awayTeam} kickoff window elapsed`,
+        };
+      }
+    } else if (allowLive) {
+      if (!matchIsLive) {
+        return {
+          valid: false,
+          refreshedSelections: [],
+          reason: `Match ${sel.homeTeam} vs ${sel.awayTeam} is not currently live`,
+        };
+      }
+    } else if (matchIsLive || liveMatch.estimateStartTime <= nowMs) {
       return {
         valid: false,
         refreshedSelections: [],
@@ -540,6 +633,10 @@ export function revalidateTicketSelectionsAgainstMatches(
 
     refreshedSelections.push({
       ...sel,
+      sportId: liveMatch.sportId || sel.sportId || 'sr:sport:1',
+      sportName: liveMatch.sportName || sel.sportName || 'Football',
+      isLive: matchIsLive,
+      matchStatus: liveMatch.matchStatus || sel.matchStatus,
       odds: outcome.odds,
       retrievedAt: liveMatch.retrievedAt,
     });
@@ -553,6 +650,12 @@ export function generateDailyPortfolioFromMatches(params: {
   config: DailyFactoryConfig;
   targetCount: number;
   sourceType?: 'DAILY_FACTORY' | 'ADMIN_MANUAL';
+  feedSection?: FeedSection;
+  allowLive?: boolean;
+  allowBothLiveAndUpcoming?: boolean;
+  ignoreScheduleWindow?: boolean;
+  skipMarketFilter?: boolean;
+  replacedTicketId?: string | null;
   existingSignatures?: Set<string>;
   existingEventIds?: Set<string>;
   existingTeamKeys?: Set<string>;
@@ -565,6 +668,7 @@ export function generateDailyPortfolioFromMatches(params: {
   const { matches, config } = params;
   const nowMs = params.nowMs ?? Date.now();
   const sourceType = params.sourceType ?? 'DAILY_FACTORY';
+  const feedSection: FeedSection = params.feedSection ?? 'UPCOMING';
   const targetCount = Math.max(1, Math.min(200, params.targetCount));
   const existingSignatures = new Set(params.existingSignatures || []);
 
@@ -573,14 +677,20 @@ export function generateDailyPortfolioFromMatches(params: {
   );
   const bookmakerInfo = getBookmakerInfo(activeBookmaker);
 
-  const candidates = discoverEligibleSelections(matches, config, nowMs);
+  const candidates = discoverEligibleSelections(matches, config, nowMs, {
+    allowLive: params.allowLive,
+    allowBothLiveAndUpcoming: params.allowBothLiveAndUpcoming,
+    ignoreScheduleWindow: params.ignoreScheduleWindow,
+    skipMarketFilter: params.skipMarketFilter,
+  });
+
   if (candidates.length === 0) {
     return {
       tickets: [],
       eligibleSelectionsFound: 0,
-      shortfallReason: `No upcoming ${bookmakerInfo.shortName} matches had active outcomes strictly between ${config.minIndividualOdds.toFixed(
+      shortfallReason: `No ${feedSection === 'LIVE_FOOTBALL' ? 'live football' : feedSection === 'OTHER_SPORTS' ? 'non-football' : 'upcoming'} ${bookmakerInfo.shortName} matches had active outcomes strictly between ${config.minIndividualOdds.toFixed(
         2
-      )} and ${config.maxIndividualOdds.toFixed(2)} within the configured schedule.`,
+      )} and ${config.maxIndividualOdds.toFixed(2)}.`,
     };
   }
 
@@ -592,10 +702,15 @@ export function generateDailyPortfolioFromMatches(params: {
   }
   const uniqueEvents = Array.from(byEvent.keys());
 
-  const categories =
+  const configuredCategories =
     config.oddsCategories && config.oddsCategories.length > 0
       ? config.oddsCategories
       : DEFAULT_ODDS_CATEGORIES;
+
+  const isSpecialSection = feedSection === 'LIVE_FOOTBALL' || feedSection === 'OTHER_SPORTS';
+  const categories = isSpecialSection
+    ? LIVE_AND_OTHER_FALLBACK_CATEGORIES
+    : configuredCategories;
 
   const minLegs = Math.max(1, Math.min(25, config.minSelections));
   const maxLegs = Math.max(minLegs, Math.min(25, config.maxSelections));
@@ -606,9 +721,10 @@ export function generateDailyPortfolioFromMatches(params: {
     activeBookmaker === 'BETPAWA_TZ'
       ? 'betPawa Tanzania Public API (/api/sportsbook/v4)'
       : 'SportyBet Tanzania Public API (/api/tz)';
-  const ticketPrefix = activeBookmaker === 'BETPAWA_TZ' ? 'BP' : 'SB';
+  const basePrefix = activeBookmaker === 'BETPAWA_TZ' ? 'BP' : 'SB';
+  const sectionCode =
+    feedSection === 'LIVE_FOOTBALL' ? 'LIVE' : feedSection === 'OTHER_SPORTS' ? 'OTH' : 'DAY';
 
-  // Compute proportional quota per category, then allow overflow attempts across remaining categories
   const totalWeight = categories.reduce((s, c) => s + Math.max(1, c.weight || 1), 0);
   const categorySchedule: OddsCategoryConfig[] = [];
   for (const cat of categories) {
@@ -663,10 +779,16 @@ export function generateDailyPortfolioFromMatches(params: {
       (max, p) => Math.max(max, p.estimateStartTime),
       picks[0].estimateStartTime
     );
-    const internalTicketId = `${ticketPrefix}-${generatedDateKey.replace(/-/g, '')}-${crypto
+    const internalTicketId = `${basePrefix}-${sectionCode}-${generatedDateKey.replace(/-/g, '')}-${crypto
       .randomBytes(3)
       .toString('hex')
       .toUpperCase()}`;
+
+    const distinctSports = Array.from(new Set(picks.map((p) => p.sportName || 'Football')));
+    const distinctSportIds = Array.from(new Set(picks.map((p) => p.sportId || 'sr:sport:1')));
+    const ticketSportId = distinctSportIds.length === 1 ? distinctSportIds[0] : 'multi:sports';
+    const ticketSportName =
+      distinctSports.length === 1 ? distinctSports[0] : distinctSports.slice(0, 2).join(' + ');
 
     tickets.push({
       internalTicketId,
@@ -674,6 +796,10 @@ export function generateDailyPortfolioFromMatches(params: {
       bookmakerId: activeBookmaker,
       bookmakerName: bookmakerInfo.name,
       bookmakerUrl: bookmakerInfo.websiteUrl,
+      feedSection,
+      sportId: ticketSportId,
+      sportName: ticketSportName,
+      replacedTicketId: params.replacedTicketId ?? null,
       sourceType,
       categoryId: cat.id,
       categoryLabel: cat.label,
@@ -689,18 +815,18 @@ export function generateDailyPortfolioFromMatches(params: {
       generatedDateKey,
       published: true,
       revalidatedAt: generatedAt,
-      status: 'PENDING',
+      status: picks.some((p) => p.isLive) ? 'LIVE' : 'PENDING',
       effectiveCombinedOdds: actualCombinedOdds,
       selectionSettlements: picks.map((p) => ({
         selectionKey: p.selectionKey,
         eventId: p.eventId,
-        status: 'PENDING',
+        status: p.isLive ? 'LIVE' : 'PENDING',
         officialMatchStatus: p.matchStatus,
         score: null,
         playedSeconds: null,
         currentOdds: p.odds,
         oddsChanged: false,
-        reason: 'Awaiting kickoff',
+        reason: p.isLive ? 'Live In-Play selection' : 'Awaiting kickoff',
         checkedAt: generatedAt,
       })),
       shareCode: null,
@@ -750,7 +876,7 @@ export function generateDailyPortfolioFromMatches(params: {
   // PASS 2: Fallback ONLY when not enough unused matches/teams remain to hit targetCount
   if (tickets.length < targetCount) {
     let fallbackFailures = 0;
-    const maxPass2Iterations = Math.max((targetCount - tickets.length) * 4, 120);
+    const maxPass2Iterations = Math.max((targetCount - tickets.length) * 5, 160);
     for (let iter = 0; iter < maxPass2Iterations && tickets.length < targetCount; iter++) {
       const cat =
         categorySchedule[(tickets.length + iter) % categorySchedule.length] ||
@@ -785,10 +911,10 @@ export function generateDailyPortfolioFromMatches(params: {
       tickets.length === 0
         ? `0 combinations satisfied target odds categories with individual odds strictly within ${config.minIndividualOdds.toFixed(
             2
-          )}–${config.maxIndividualOdds.toFixed(2)} across ${uniqueEvents.length} qualifying upcoming matches.`
-        : `Published ${tickets.length} of ${targetCount} daily target tickets from ${uniqueEvents.length} qualifying upcoming matches (${candidates.length} active selections within ${config.minIndividualOdds.toFixed(
+          )}–${config.maxIndividualOdds.toFixed(2)} across ${uniqueEvents.length} qualifying ${feedSection.toLowerCase()} matches.`
+        : `Published ${tickets.length} of ${targetCount} target tickets from ${uniqueEvents.length} qualifying matches (${candidates.length} active selections within ${config.minIndividualOdds.toFixed(
             2
-          )}–${config.maxIndividualOdds.toFixed(2)}). Remaining combinations were exhausted without duplicating tickets or relaxing odds bounds.`;
+          )}–${config.maxIndividualOdds.toFixed(2)}).`;
   }
 
   return {
@@ -848,4 +974,122 @@ export async function fetchUpcomingMatchesForFactory(
   }
 
   return allMatches;
+}
+
+export async function fetchLiveFootballMatchesForFactory(
+  config: DailyFactoryConfig
+): Promise<NormalizedMatch[]> {
+  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+  const client = getBookmakerClient(bookmakerId);
+
+  const summaryLive = await client.getLiveMatches('sr:sport:1').catch(() => []);
+  if (summaryLive.length === 0) return [];
+
+  // SportyBet's live summary only returns 1X2 & Next Goal, so enrich with getMatchDetails to obtain Double Chance (10), O/U (18), GG/NG (29), Odd/Even (26).
+  const targetPool = summaryLive.slice(0, 40);
+  const enriched: NormalizedMatch[] = [];
+
+  for (let i = 0; i < targetPool.length; i += 8) {
+    const chunk = targetPool.slice(i, i + 8);
+    const detailsList = await Promise.all(
+      chunk.map(async (ev) => {
+        const hasAllowed = ev.markets.some(
+          (m) => m.status === 0 && !m.banned && !isDisallowedDailyFeedMarket(m.marketId, m.desc || m.name)
+        );
+        if (hasAllowed) return ev;
+        try {
+          const full = await client.getMatchDetails(ev.eventId);
+          return {
+            ...full,
+            sportId: full.sportId || 'sr:sport:1',
+            sportName: full.sportName || 'Football',
+            isLive: true,
+          };
+        } catch {
+          return ev;
+        }
+      })
+    );
+    enriched.push(...detailsList);
+  }
+
+  return enriched;
+}
+
+export async function fetchOtherSportsMatchesForFactory(
+  config: DailyFactoryConfig
+): Promise<NormalizedMatch[]> {
+  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+  const client = getBookmakerClient(bookmakerId);
+  if (bookmakerId === 'BETPAWA_TZ') {
+    return [];
+  }
+
+  const allOtherMatches: NormalizedMatch[] = [];
+  const seenEvents = new Set<string>();
+
+  for (const sportId of NON_FOOTBALL_SPORT_IDS) {
+    try {
+      const [{ matches: upcoming }, live] = await Promise.all([
+        client
+          .getUpcomingMatches({
+            pageNum: 1,
+            pageSize: 60,
+            maxPages: 2,
+            marketIds: MULTI_SPORT_SAFE_MARKET_IDS,
+            sportId,
+          })
+          .catch(() => ({ matches: [] as NormalizedMatch[], totalAvailable: 0 })),
+        client.getLiveMatches(sportId).catch(() => [] as NormalizedMatch[]),
+      ]);
+
+      for (const m of [...live, ...upcoming]) {
+        if (!seenEvents.has(m.eventId)) {
+          seenEvents.add(m.eventId);
+          allOtherMatches.push(m);
+        }
+      }
+    } catch {
+      // Skip failing sport cleanly
+    }
+  }
+
+  // Enrich sparse non-football events that didn't include totals/safe markets in summary
+  const sparseEvents = allOtherMatches
+    .filter(
+      (m) =>
+        m.statusCode < 3 &&
+        !m.markets.some(
+          (mkt) =>
+            mkt.status === 0 &&
+            !mkt.banned &&
+            !isDisallowedDailyFeedMarket(mkt.marketId, mkt.desc || mkt.name)
+        )
+    )
+    .slice(0, 32);
+
+  if (sparseEvents.length > 0) {
+    const detailedMap = new Map<string, NormalizedMatch>();
+    for (let i = 0; i < sparseEvents.length; i += 8) {
+      const chunk = sparseEvents.slice(i, i + 8);
+      await Promise.all(
+        chunk.map(async (ev) => {
+          try {
+            const full = await client.getMatchDetails(ev.eventId);
+            detailedMap.set(ev.eventId, {
+              ...full,
+              sportId: ev.sportId || full.sportId,
+              sportName: ev.sportName || full.sportName,
+              isLive: ev.isLive || full.isLive,
+            });
+          } catch {
+            // ignore
+          }
+        })
+      );
+    }
+    return allOtherMatches.map((m) => detailedMap.get(m.eventId) || m);
+  }
+
+  return allOtherMatches;
 }

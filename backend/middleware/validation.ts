@@ -26,21 +26,23 @@ export const betslipSelectionSchema = z.object({
   selectionKey: z.string().min(1).max(200),
   bookmakerId: bookmakerEnum.optional(),
   bookmakerName: z.string().max(100).optional(),
+  sportId: z.string().max(40).optional(),
+  sportName: z.string().max(60).optional(),
   eventId: z.string().min(1).max(100),
   homeTeam: z.string().min(1).max(140),
   awayTeam: z.string().min(1).max(140),
   leagueName: z.string().max(140).default('Football'),
   country: z.string().max(100).default('International'),
-  estimateStartTime: z.number().nonnegative(),
+  estimateStartTime: z.number().nonnegative().default(0),
   matchStatus: z.string().max(40).default('Not start'),
   isLive: z.boolean().default(false),
-  marketId: z.string().min(1).max(40),
-  marketName: z.string().min(1).max(120),
-  specifier: z.string().max(80).default(''),
-  outcomeId: z.string().min(1).max(40),
-  outcomeDesc: z.string().min(1).max(120),
-  odds: z.number().gt(1.0).max(10000),
-  addedAt: z.string().max(60),
+  marketId: z.string().min(1).max(80),
+  marketName: z.string().min(1).max(160),
+  specifier: z.string().max(120).default(''),
+  outcomeId: z.string().min(1).max(80),
+  outcomeDesc: z.string().min(1).max(160),
+  odds: z.number().min(1.0).max(10000),
+  addedAt: z.string().max(60).default(''),
 });
 
 export const betslipPayloadSchema = z.object({
@@ -70,6 +72,9 @@ export const dailyFactoryConfigSchema = z
     minIndividualOdds: z.number().min(1.01).max(100),
     maxIndividualOdds: z.number().min(1.01).max(1000),
     dailyTicketTarget: z.number().int().min(1).max(200),
+    liveFootballTarget: z.number().int().min(10).max(100).optional(),
+    otherSportsTarget: z.number().int().min(10).max(100).optional(),
+    autoReplenishOnSettle: z.boolean().optional(),
     maxTickets: z.number().int().min(1).max(200),
     minSelections: z.number().int().min(1).max(25),
     maxSelections: z.number().int().min(1).max(25),
@@ -97,28 +102,32 @@ export const dailyFactoryConfigSchema = z
     path: ['maxSelections'],
   });
 
+export const hydrateTicketsSchema = z.object({
+  tickets: z.array(z.record(z.string(), z.unknown())).max(600),
+});
+
 export const transferDirectionEnum = z.enum(['SPORTYBET_TO_BETPAWA', 'BETPAWA_TO_SPORTYBET']);
 
 export const transferSourceSelectionSchema = z.object({
-  id: z.string().min(1).max(120),
+  id: z.string().min(1).max(160),
   homeTeam: z.string().min(1).max(140),
   awayTeam: z.string().min(1).max(140),
   leagueName: z.string().max(140).optional(),
   country: z.string().max(100).optional(),
   estimateStartTime: z.number().nonnegative().optional(),
-  marketId: z.string().max(40).optional(),
-  marketName: z.string().min(1).max(120),
-  specifier: z.string().max(80).optional(),
-  outcomeId: z.string().max(40).optional(),
-  outcomeDesc: z.string().min(1).max(120),
-  odds: z.number().gt(1.0).max(10000),
-  eventId: z.string().max(100).optional(),
+  marketId: z.string().max(80).optional(),
+  marketName: z.string().min(1).max(160),
+  specifier: z.string().max(120).optional(),
+  outcomeId: z.string().max(80).optional(),
+  outcomeDesc: z.string().min(1).max(160),
+  odds: z.number().min(1.0).max(10000),
+  eventId: z.string().max(120).optional(),
 });
 
 export const transferPreviewSchema = z
   .object({
     direction: transferDirectionEnum,
-    bookingCode: z.string().trim().max(32).optional(),
+    bookingCode: z.string().trim().max(300).optional(),
     manualSelections: z.array(transferSourceSelectionSchema).max(30).optional(),
   })
   .refine(
@@ -133,7 +142,7 @@ export const transferPreviewSchema = z
 export const transferConfirmSchema = z.object({
   transferId: z.string().min(1).max(120).optional(),
   direction: transferDirectionEnum,
-  originalCode: z.string().max(32).default('MANUAL'),
+  originalCode: z.string().max(120).default('MANUAL'),
   originalSelectionCount: z.number().int().min(1).max(30),
   originalCombinedOdds: z.number().min(1.0).max(1000000),
   confirmedSelections: z.array(betslipSelectionSchema).min(1).max(30),

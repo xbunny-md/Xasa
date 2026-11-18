@@ -31,7 +31,10 @@ export const DEFAULT_DAILY_FACTORY_CONFIG: DailyFactoryConfig = {
   minIndividualOdds: 1.01,
   maxIndividualOdds: 1.25,
   dailyTicketTarget: 55,
-  maxTickets: 100,
+  liveFootballTarget: 12,
+  otherSportsTarget: 12,
+  autoReplenishOnSettle: true,
+  maxTickets: 120,
   minSelections: 2,
   maxSelections: 15,
   sportIds: ['sr:sport:1'],
@@ -55,6 +58,24 @@ const DATA_DIR = process.env.VERCEL
   : path.resolve(process.cwd(), '.data');
 const STATE_FILE = path.join(DATA_DIR, 'automation-state.json');
 
+function isTerminalStatus(status: string | undefined): boolean {
+  return status === 'WON' || status === 'LOST' || status === 'VOID';
+}
+
+function normalizeStoredTicket(t: GeneratedTicket): GeneratedTicket {
+  return {
+    ...t,
+    bookmakerId: t.bookmakerId || 'SPORTYBET_TZ',
+    bookmakerName:
+      t.bookmakerName ||
+      (t.bookmakerId === 'BETPAWA_TZ' ? 'betPawa Tanzania' : 'SportyBet Tanzania'),
+    feedSection: t.feedSection || 'UPCOMING',
+    sportId: t.sportId || t.selections?.[0]?.sportId || 'sr:sport:1',
+    sportName: t.sportName || t.selections?.[0]?.sportName || 'Football',
+    replacedTicketId: t.replacedTicketId ?? null,
+  };
+}
+
 class AutomationStore {
   private state: PersistedState;
 
@@ -71,6 +92,9 @@ class AutomationStore {
           const mergedCfg: DailyFactoryConfig = {
             ...DEFAULT_DAILY_FACTORY_CONFIG,
             ...(parsed.factoryConfig || {}),
+            liveFootballTarget: Math.max(10, parsed.factoryConfig?.liveFootballTarget ?? 12),
+            otherSportsTarget: Math.max(10, parsed.factoryConfig?.otherSportsTarget ?? 12),
+            autoReplenishOnSettle: parsed.factoryConfig?.autoReplenishOnSettle ?? true,
           };
           if (!Array.isArray(mergedCfg.oddsCategories) || mergedCfg.oddsCategories.length === 0) {
             mergedCfg.oddsCategories = DEFAULT_ODDS_CATEGORIES;
@@ -80,13 +104,7 @@ class AutomationStore {
             sanitizedMarkets.length > 0 ? sanitizedMarkets : [...DEFAULT_ALLOWED_DAILY_FEED_MARKETS];
 
           const rawTickets: GeneratedTicket[] = Array.isArray(parsed.tickets)
-            ? parsed.tickets.map((t) => ({
-                ...t,
-                bookmakerId: t.bookmakerId || 'SPORTYBET_TZ',
-                bookmakerName:
-                  t.bookmakerName ||
-                  (t.bookmakerId === 'BETPAWA_TZ' ? 'betPawa Tanzania' : 'SportyBet Tanzania'),
-              }))
+            ? parsed.tickets.map(normalizeStoredTicket)
             : [];
           const tickets = rawTickets.filter((t) => isTicketAllowedInDailyFeed(t));
           const sanitizedState: PersistedState = {
@@ -160,7 +178,10 @@ class AutomationStore {
     return codes;
   }
 
-  getExistingEventAndTeamUsage(dateKey?: string): {
+  getExistingEventAndTeamUsage(
+    dateKey?: string,
+    feedSection?: GeneratedTicket['feedSection']
+  ): {
     eventIds: Set<string>;
     teamKeys: Set<string>;
   } {
@@ -168,6 +189,7 @@ class AutomationStore {
     const teamKeys = new Set<string>();
     for (const t of this.getTickets()) {
       if (dateKey && t.generatedDateKey !== dateKey) continue;
+      if (feedSection && (t.feedSection || 'UPCOMING') !== feedSection) continue;
       for (const s of t.selections || []) {
         if (s.eventId) eventIds.add(s.eventId);
         if (s.homeTeam) teamKeys.add(normalizeTeamKey(s.homeTeam));
@@ -182,7 +204,8 @@ class AutomationStore {
     const existingSigs = new Set(this.state.tickets.map((t) => t.signature));
     const existingCodes = this.getExistingShareCodes();
     const inserted: GeneratedTicket[] = [];
-    for (const t of newTickets) {
+    for (const rawTicket of newTickets) {
+      const t = normalizeStoredTicket(rawTicket);
       if (!isTicketAllowedInDailyFeed(t)) continue;
       if (existingIds.has(t.internalTicketId) || existingSigs.has(t.signature)) continue;
       existingIds.add(t.internalTicketId);
@@ -204,10 +227,67 @@ class AutomationStore {
       }
     }
     if (inserted.length > 0) {
-      this.state.tickets = [...inserted, ...this.state.tickets].slice(0, 600);
+      this.state.tickets = [...inserted, ...this.state.tickets].slice(0, 1000);
       this.flushToDisk();
     }
     return inserted;
+  }
+
+  /**
+   * Hydrate backend memory from Firebase publicTickets (used after Vercel cold starts)
+   * without ever mutating immutable ticket fields or overwriting terminal settled results.
+   */
+  hydrateTickets(incoming: GeneratedTicket[]): number {
+    if (!Array.isArray(incoming) || incoming.length === 0) return 0;
+    const byId = new Map<string, number>();
+    const existingSigs = new Set<string>();
+    this.state.tickets.forEach((t, idx) => {
+      byId.set(t.internalTicketId, idx);
+      existingSigs.add(t.signature);
+    });
+
+    let addedOrUpdated = 0;
+    const toPrepend: GeneratedTicket[] = [];
+
+    for (const raw of incoming) {
+      const ticket = normalizeStoredTicket(raw);
+      if (!isTicketAllowedInDailyFeed(ticket)) continue;
+      const existingIdx = byId.get(ticket.internalTicketId);
+
+      if (existingIdx === undefined) {
+        if (existingSigs.has(ticket.signature)) continue;
+        existingSigs.add(ticket.signature);
+        toPrepend.push(ticket);
+        addedOrUpdated++;
+      } else {
+        const current = this.state.tickets[existingIdx];
+        // Never overwrite a local terminal result, and adopt incoming terminal result if local isn't terminal yet
+        if (!isTerminalStatus(current.status) && isTerminalStatus(ticket.status)) {
+          this.state.tickets[existingIdx] = {
+            ...current,
+            status: ticket.status,
+            effectiveCombinedOdds: ticket.effectiveCombinedOdds,
+            selectionSettlements: ticket.selectionSettlements,
+            settledAt: ticket.settledAt,
+            lastCheckedAt: ticket.lastCheckedAt,
+            shareCode: current.shareCode || ticket.shareCode,
+            shareUrl: current.shareUrl || ticket.shareUrl,
+            shareCodeVerified: current.shareCodeVerified || ticket.shareCodeVerified,
+            bookingCodeStatus:
+              current.shareCode ? current.bookingCodeStatus : ticket.bookingCodeStatus,
+          };
+          addedOrUpdated++;
+        }
+      }
+    }
+
+    if (toPrepend.length > 0 || addedOrUpdated > 0) {
+      this.state.tickets = [...toPrepend, ...this.state.tickets]
+        .sort((a, b) => Date.parse(b.generatedAt) - Date.parse(a.generatedAt))
+        .slice(0, 1000);
+      this.flushToDisk();
+    }
+    return addedOrUpdated;
   }
 
   updateTicketMutableFields(updated: GeneratedTicket): GeneratedTicket | null {
@@ -217,6 +297,11 @@ class AutomationStore {
     if (idx === -1) return null;
 
     const original = this.state.tickets[idx];
+    // Strict immutability & terminal lock: never alter settled WON / LOST / VOID tickets
+    if (isTerminalStatus(original.status)) {
+      return original;
+    }
+
     const merged: GeneratedTicket = {
       ...original,
       status: updated.status,
@@ -256,7 +341,11 @@ class AutomationStore {
   setFactoryConfig(config: DailyFactoryConfig): DailyFactoryConfig {
     const sanitizedMarkets = sanitizeDailyFactoryMarkets(config.markets || []);
     this.state.factoryConfig = {
+      ...DEFAULT_DAILY_FACTORY_CONFIG,
       ...config,
+      liveFootballTarget: Math.max(10, config.liveFootballTarget ?? 12),
+      otherSportsTarget: Math.max(10, config.otherSportsTarget ?? 12),
+      autoReplenishOnSettle: config.autoReplenishOnSettle ?? true,
       markets:
         sanitizedMarkets.length > 0 ? sanitizedMarkets : [...DEFAULT_ALLOWED_DAILY_FEED_MARKETS],
     };

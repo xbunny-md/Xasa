@@ -9,6 +9,11 @@ export const DISALLOWED_DAILY_FEED_MARKET_IDS = new Set([
   '1',    // SportyBet 1X2
   '11',   // SportyBet Draw No Bet
   '60',   // SportyBet 1st Half 1X2
+  '186',  // SportyBet Winner (Tennis/Volleyball/TableTennis)
+  '202',  // SportyBet Set Winner
+  '219',  // SportyBet Winner (incl. overtime)
+  '235',  // SportyBet 1st Quarter 1X2
+  '302',  // SportyBet Quarter Draw No Bet
   '3743', // betPawa 1X2
   '4703', // betPawa Draw No Bet
 ]);
@@ -17,7 +22,7 @@ export const DEFAULT_ALLOWED_DAILY_FEED_MARKETS = ['10', '18', '29', '26', '36']
 
 const DISALLOWED_MARKET_NAME_PATTERNS = [
   /\b1\s*x\s*2\b/i,
-  /match\s*winner/i,
+  /\bwinner\b/i,
   /draw\s*no\s*bet/i,
   /\b3\s*-?\s*way\b/i,
   /\bfull\s*time\s*result\b/i,

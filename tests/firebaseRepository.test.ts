@@ -38,10 +38,12 @@ vi.mock('firebase/auth', () => ({
 import { handleFirestoreError, OperationType } from '../src/firebase/firestore/errors.ts';
 import {
   ensureUserProfile,
+  mapPublicDocsToGeneratedTickets,
   saveBookingCodeRecord,
   saveFavoriteItem,
   saveFilterPreset,
   saveScanHistoryRecord,
+  syncPublicTicketBundle,
   updateUserPreferences,
   updateUserSettings,
 } from '../src/firebase/firestore/repository.ts';
@@ -206,6 +208,161 @@ describe('Firebase Authentication & Firestore Operations', () => {
     });
 
     expect(setDocMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('mirrors immutable publicTickets with feedSection/sport metadata and locks settled updates', async () => {
+    getDocMock
+      .mockResolvedValueOnce({ exists: () => false }) // publicTickets does not exist yet
+      .mockResolvedValueOnce({ exists: () => false }); // publicTicketUpdates does not exist yet
+
+    await syncPublicTicketBundle('admin_uid_1', {
+      internalTicketId: 'TKT-FB-1',
+      bookmakerId: 'SPORTYBET_TZ',
+      feedSection: 'OTHER_SPORTS',
+      sportId: 'sr:sport:2',
+      sportName: 'Basketball',
+      replacedTicketId: 'TKT-OLD-1',
+      signature: 'sig_fb_1',
+      sourceType: 'DAILY_FACTORY',
+      categoryId: 'cat_2_3',
+      categoryLabel: '2.00–3.00',
+      targetOdds: 2.3,
+      actualCombinedOdds: 2.25,
+      oddsDifference: 0.05,
+      selectionCount: 1,
+      selections: [
+        {
+          selectionKey: 'k1',
+          eventId: 'ev1',
+          homeTeam: 'Team A',
+          awayTeam: 'Team B',
+          leagueId: 'l1',
+          leagueName: 'NBA',
+          country: 'USA',
+          estimateStartTime: Date.now() + 3600000,
+          matchStatus: 'Not start',
+          isLive: false,
+          marketId: '225',
+          marketName: 'Total',
+          specifier: 'total=190.5',
+          outcomeId: '12',
+          outcomeDesc: 'Over 190.5',
+          odds: 1.2,
+          addedAt: new Date().toISOString(),
+          retrievedAt: new Date().toISOString(),
+        },
+      ],
+      kickoffStartMs: Date.now() + 3600000,
+      kickoffEndMs: Date.now() + 3600000,
+      dataSource: 'SportyBet TZ',
+      generatedAt: '2026-11-25T10:00:00.000Z',
+      generatedDateKey: '2026-11-25',
+      published: true,
+      revalidatedAt: '2026-11-25T10:00:00.000Z',
+      status: 'WON',
+      effectiveCombinedOdds: 2.25,
+      selectionSettlements: [],
+      shareCode: 'XY1234',
+      shareUrl: 'https://www.sportybet.com/tz/?shareCode=XY1234',
+      shareCodeDeadline: null,
+      shareCodeVerified: true,
+      bookingCodeStatus: 'GENERATED',
+      bookingCodeError: null,
+      settledAt: '2026-11-25T15:00:00.000Z',
+      lastCheckedAt: '2026-11-25T15:00:00.000Z',
+    });
+
+    expect(setDocMock).toHaveBeenCalledTimes(2);
+    expect(setDocMock.mock.calls[0][1].feedSection).toBe('OTHER_SPORTS');
+    expect(setDocMock.mock.calls[0][1].sportName).toBe('Basketball');
+    expect(setDocMock.mock.calls[0][1].replacedTicketId).toBe('TKT-OLD-1');
+
+    // Subsequent call when Firebase already holds WON status must NOT update publicTicketUpdates
+    vi.clearAllMocks();
+    getDocMock
+      .mockResolvedValueOnce({ exists: () => true })
+      .mockResolvedValueOnce({ exists: () => true, data: () => ({ status: 'WON' }) });
+
+    await syncPublicTicketBundle('admin_uid_1', {
+      internalTicketId: 'TKT-FB-1',
+      signature: 'sig_fb_1',
+      sourceType: 'DAILY_FACTORY',
+      categoryId: 'cat_2_3',
+      categoryLabel: '2.00–3.00',
+      targetOdds: 2.3,
+      actualCombinedOdds: 2.25,
+      oddsDifference: 0.05,
+      selectionCount: 1,
+      selections: [],
+      kickoffStartMs: 1000,
+      kickoffEndMs: 1000,
+      dataSource: 'SportyBet TZ',
+      generatedAt: '2026-11-25T10:00:00.000Z',
+      generatedDateKey: '2026-11-25',
+      published: true,
+      revalidatedAt: '2026-11-25T10:00:00.000Z',
+      status: 'LOST',
+      effectiveCombinedOdds: 2.25,
+      selectionSettlements: [],
+      shareCode: 'XY1234',
+      shareUrl: 'https://www.sportybet.com/tz/?shareCode=XY1234',
+      shareCodeDeadline: null,
+      shareCodeVerified: true,
+      bookingCodeStatus: 'GENERATED',
+      bookingCodeError: null,
+      settledAt: '2026-11-25T15:00:00.000Z',
+      lastCheckedAt: null,
+    });
+
+    expect(setDocMock).not.toHaveBeenCalled();
+    expect(updateDocMock).not.toHaveBeenCalled();
+
+    const reconstructed = mapPublicDocsToGeneratedTickets(
+      [
+        {
+          id: 'TKT-FB-1',
+          isPublic: true,
+          publishedByUid: 'admin_uid_1',
+          internalTicketId: 'TKT-FB-1',
+          signature: 'sig_fb_1',
+          bookmakerId: 'SPORTYBET_TZ',
+          feedSection: 'LIVE_FOOTBALL',
+          sportId: 'sr:sport:1',
+          sportName: 'Football',
+          sourceType: 'DAILY_FACTORY',
+          categoryId: 'cat_2_3',
+          categoryLabel: '2.00–3.00',
+          targetOdds: 2.3,
+          actualCombinedOdds: 2.25,
+          selectionCount: 1,
+          kickoffStartMs: 1000,
+          kickoffEndMs: 1000,
+          dataSource: 'SportyBet TZ',
+          generatedDateKey: '2026-11-25',
+          originalSelections: [],
+        },
+      ],
+      [
+        {
+          id: 'TKT-FB-1',
+          isPublic: true,
+          internalTicketId: 'TKT-FB-1',
+          status: 'WON',
+          effectiveCombinedOdds: 2.25,
+          shareCode: 'XY1234',
+          shareUrl: 'https://www.sportybet.com/tz/?shareCode=XY1234',
+          shareCodeVerified: true,
+          bookingCodeStatus: 'GENERATED',
+          bookingCodeError: '',
+          selectionSettlements: [],
+          settledAt: '2026-11-25T15:00:00.000Z',
+        },
+      ]
+    );
+    expect(reconstructed).toHaveLength(1);
+    expect(reconstructed[0]?.feedSection).toBe('LIVE_FOOTBALL');
+    expect(reconstructed[0]?.status).toBe('WON');
+    expect(reconstructed[0]?.shareCode).toBe('XY1234');
   });
 
   it('formats structured FirestoreErrorInfo with auth context on permission failure', () => {

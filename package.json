@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
-    "build:api": "esbuild backend/vercelEntry.ts --bundle --platform=node --target=node20 --packages=external --format=cjs --outfile=api/_handler.cjs",
+    "build:api": "esbuild backend/vercelEntry.ts --bundle --platform=node --target=node20 --packages=external --format=esm --outfile=api/_handler.mjs",
     "build": "vite build && npm run build:api",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",

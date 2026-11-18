@@ -303,6 +303,7 @@ export const apiClient = {
   trackTicketsResults: (token: string, ticketIds?: string[]) =>
     apiFetch<{
       updatedTickets: GeneratedTicket[];
+      replenishedTickets?: GeneratedTicket[];
       log: AutomationJobLog;
       status: SchedulerStatus;
       tickets: GeneratedTicket[];
@@ -312,6 +313,19 @@ export const apiClient = {
       {
         method: 'POST',
         body: JSON.stringify({ ticketIds }),
+      },
+      token
+    ),
+  hydrateTickets: (tickets: GeneratedTicket[], token: string) =>
+    apiFetch<{
+      hydratedCount: number;
+      totalTickets: number;
+      status: SchedulerStatus;
+    }>(
+      '/api/tickets/hydrate',
+      {
+        method: 'POST',
+        body: JSON.stringify({ tickets }),
       },
       token
     ),

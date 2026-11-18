@@ -98,6 +98,16 @@ const LEG_STATUS_STYLE: Record<
   },
 };
 
+function extractCleanCodeFromInput(rawInput: string): string {
+  const raw = (rawInput || '').trim();
+  if (!raw) return '';
+  const paramMatch = /(?:shareCode|bookingNumber|code)=([A-Za-z0-9_-]{3,32})/i.exec(raw);
+  if (paramMatch?.[1]) return paramMatch[1].toUpperCase();
+  const pathMatch = /\/(?:share|booking-number)\/([A-Za-z0-9_-]{3,32})/i.exec(raw);
+  if (pathMatch?.[1]) return pathMatch[1].toUpperCase();
+  return raw.replace(/[^A-Za-z0-9_-]/g, '').toUpperCase().slice(0, 32);
+}
+
 function createEmptyManualSelection(): TransferSourceSelection {
   return {
     id: `man_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
@@ -238,10 +248,11 @@ export function CrossTransferPage() {
       };
 
       if (mode === 'code') {
-        const code = bookingCodeInput.trim();
-        if (!code) {
-          throw new Error(`Enter a valid ${sourceInfo.short} booking code first.`);
+        const code = extractCleanCodeFromInput(bookingCodeInput);
+        if (code.length < 3) {
+          throw new Error(`Enter a valid ${sourceInfo.short} booking code or share link first.`);
         }
+        setBookingCodeInput(code);
         payload = { direction, bookingCode: code };
       } else {
         const validManual = manualSelections.filter(
@@ -316,6 +327,36 @@ export function CrossTransferPage() {
       next.add(legId);
       return next;
     });
+  };
+
+  const removeAllUnavailableLegs = () => {
+    if (!preview) return;
+    const ids = preview.legs
+      .filter((l) => !l.targetSelection)
+      .map((l) => l.sourceSelection.id);
+    setHiddenUnavailableIds(new Set(ids));
+  };
+
+  const applyCandidateToManual = (
+    legSource: TransferSourceSelection,
+    cand: NonNullable<TransferPreviewResponse['legs'][number]['candidateMatches']>[number]
+  ) => {
+    setShowManualImport(true);
+    setManualSelections((prev) => {
+      const nonEmpty = prev.filter((item) => item.homeTeam.trim() && item.awayTeam.trim());
+      return [
+        ...nonEmpty,
+        {
+          ...legSource,
+          id: `cand_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+          homeTeam: cand.homeTeam,
+          awayTeam: cand.awayTeam,
+          leagueName: cand.leagueName,
+          estimateStartTime: cand.estimateStartTime,
+        },
+      ];
+    });
+    setPreviewError(null);
   };
 
   const handleConfirmTransfer = async () => {
@@ -557,10 +598,10 @@ export function CrossTransferPage() {
           <input
             type="text"
             value={bookingCodeInput}
-            onChange={(e) => setBookingCodeInput(e.target.value.toUpperCase())}
-            placeholder={`Paste ${sourceInfo.short} booking code (e.g. BC12AB)`}
+            onChange={(e) => setBookingCodeInput(e.target.value)}
+            placeholder={`Paste ${sourceInfo.short} booking code or share link (e.g. BC12AB)`}
             disabled={!crossTransferEnabled || previewing}
-            className="flex-1 px-3.5 py-2.5 rounded-lg bg-slate-50 dark:bg-[#0B101B] border border-slate-200 dark:border-white/10 text-sm font-mono uppercase text-slate-900 dark:text-white placeholder:normal-case placeholder:font-sans"
+            className="flex-1 px-3.5 py-2.5 rounded-lg bg-slate-50 dark:bg-[#0B101B] border border-slate-200 dark:border-white/10 text-sm font-mono text-slate-900 dark:text-white placeholder:font-sans"
           />
           <button
             type="submit"
@@ -970,6 +1011,32 @@ export function CrossTransferPage() {
                       <p className="text-[11px] text-slate-500 dark:text-slate-400">
                         {leg.reason} {leg.settlementRuleNote}
                       </p>
+
+                      {!leg.targetSelection &&
+                        leg.candidateMatches &&
+                        leg.candidateMatches.length > 0 && (
+                          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                            <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                              Close {targetInfo.short} fixtures:
+                            </span>
+                            {leg.candidateMatches.map((cand) => (
+                              <button
+                                key={cand.eventId}
+                                type="button"
+                                onClick={() =>
+                                  applyCandidateToManual(leg.sourceSelection, cand)
+                                }
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-blue-50 dark:bg-blue-500/15 border border-blue-200 dark:border-blue-500/30 text-[11px] text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-500/25"
+                                title={cand.reason}
+                              >
+                                <span>
+                                  {cand.homeTeam} vs {cand.awayTeam} (
+                                  {(cand.confidenceScore * 100).toFixed(0)}%)
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0">
@@ -996,12 +1063,26 @@ export function CrossTransferPage() {
 
           {/* Review & Confirmation Footer Actions */}
           <div className="p-5 bg-slate-50 dark:bg-[#0B101B] border-t border-slate-200 dark:border-white/[0.08] flex flex-wrap items-center justify-between gap-3">
-            <div className="text-xs text-slate-600 dark:text-slate-400">
-              Never substitutes unavailable outcomes. Confirming sends only verified matched legs to{' '}
-              <span className="font-semibold text-slate-900 dark:text-white">
-                {targetInfo.name}
+            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600 dark:text-slate-400">
+              <span>
+                Never substitutes unavailable outcomes. Confirming sends only verified matched legs to{' '}
+                <span className="font-semibold text-slate-900 dark:text-white">
+                  {targetInfo.name}
+                </span>
+                .
               </span>
-              .
+              {preview.legs.some(
+                (l) => !l.targetSelection && !hiddenUnavailableIds.has(l.sourceSelection.id)
+              ) && (
+                <button
+                  type="button"
+                  onClick={removeAllUnavailableLegs}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-amber-300 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 text-amber-800 dark:text-amber-200 text-[11px] font-medium hover:bg-amber-100 dark:hover:bg-amber-500/20"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>Hide Unmatched / Unavailable</span>
+                </button>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-2.5">

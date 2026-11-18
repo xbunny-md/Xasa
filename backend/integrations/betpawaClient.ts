@@ -368,6 +368,8 @@ export class BetPawaClient {
     return {
       bookmakerId: 'BETPAWA_TZ',
       bookmakerName: 'betPawa Tanzania',
+      sportId: 'sr:sport:1',
+      sportName: 'Football',
       eventId: String(raw.id),
       gameId: String(raw.id),
       homeTeam,
@@ -485,7 +487,7 @@ export class BetPawaClient {
   }): Promise<{ matches: NormalizedMatch[]; totalAvailable: number }> {
     const pageNum = Math.max(1, options?.pageNum ?? 1);
     const pageSize = Math.min(Math.max(options?.pageSize ?? 50, 10), 100);
-    const maxPages = Math.min(Math.max(options?.maxPages ?? 1, 1), 8);
+    const maxPages = Math.min(Math.max(options?.maxPages ?? 1, 1), 12);
     const requestedMarketIds = options?.marketIds
       ? options.marketIds
           .split(',')
@@ -502,7 +504,7 @@ export class BetPawaClient {
     const retrievedAt = new Date().toISOString();
     let totalAvailable = 0;
 
-    for (let p = pageNum; p < pageNum + maxPages; p++) {
+    const fetchPage = async (p: number) => {
       const skip = (p - 1) * pageSize;
       const qObj = {
         queries: [
@@ -524,25 +526,48 @@ export class BetPawaClient {
           responses?: RawBetPawaEvent[];
         }>;
       }>(url);
+      return json.responses?.[0];
+    };
 
-      const batch = json.responses?.[0]?.responses || [];
-      if (json.responses?.[0]?.totalCount !== undefined) {
-        totalAvailable = Number(json.responses[0].totalCount);
+    const firstRes = await fetchPage(pageNum);
+    const firstBatch = firstRes?.responses || [];
+    if (firstRes?.totalCount !== undefined) {
+      totalAvailable = Number(firstRes.totalCount);
+    }
+
+    for (const ev of firstBatch) {
+      const normalized = this.normalizeEvent(ev, false, retrievedAt);
+      if (normalized && !seen.has(normalized.eventId)) {
+        seen.add(normalized.eventId);
+        matches.push(normalized);
       }
+    }
 
-      for (const ev of batch) {
-        const normalized = this.normalizeEvent(ev, false, retrievedAt);
-        if (normalized && !seen.has(normalized.eventId)) {
-          seen.add(normalized.eventId);
-          matches.push(normalized);
+    if (firstBatch.length >= pageSize && maxPages > 1) {
+      const maxNeeded =
+        totalAvailable > 0
+          ? Math.min(maxPages, Math.ceil(totalAvailable / pageSize))
+          : maxPages;
+      const pageNumbers = Array.from(
+        { length: Math.max(0, maxNeeded - 1) },
+        (_, idx) => pageNum + idx + 1
+      );
+      if (pageNumbers.length > 0) {
+        const restPages = await Promise.all(
+          pageNumbers.map((p) => fetchPage(p).catch(() => undefined))
+        );
+        for (const pageRes of restPages) {
+          for (const ev of pageRes?.responses || []) {
+            const normalized = this.normalizeEvent(ev, false, retrievedAt);
+            if (normalized && !seen.has(normalized.eventId)) {
+              seen.add(normalized.eventId);
+              matches.push(normalized);
+            }
+          }
         }
       }
-
-      if (batch.length < pageSize) {
-        totalAvailable = Math.max(totalAvailable, skip + batch.length);
-        break;
-      }
-      totalAvailable = Math.max(totalAvailable, skip + batch.length + pageSize);
+    } else if (totalAvailable === 0) {
+      totalAvailable = (pageNum - 1) * pageSize + firstBatch.length;
     }
 
     const result = { matches, totalAvailable };
@@ -624,7 +649,11 @@ export class BetPawaClient {
       );
     }
 
-    const verified = await this.verifyBookingCode(code).catch(() => null);
+    let verified = await this.verifyBookingCode(code).catch(() => null);
+    if (!verified) {
+      await new Promise((r) => setTimeout(r, 300));
+      verified = await this.verifyBookingCode(code).catch(() => null);
+    }
     this.lastSuccessTimestamps.set('betpawa_booking', new Date().toISOString());
 
     const combinedOdds = Number(
@@ -729,6 +758,8 @@ export class BetPawaClient {
       mappedSelections.push({
         bookmakerId: 'BETPAWA_TZ',
         bookmakerName: 'betPawa Tanzania',
+        sportId: 'sr:sport:1',
+        sportName: 'Football',
         selectionKey: `${ev.id}::${mTypeId}::${specifier}::${outcomeId}`,
         eventId: String(ev.id),
         homeTeam,

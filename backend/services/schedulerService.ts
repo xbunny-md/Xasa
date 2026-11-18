@@ -11,6 +11,8 @@ import type {
 } from '../../src/types/sportybet.ts';
 import { automationStore } from './automationStore.ts';
 import {
+  fetchLiveFootballMatchesForFactory,
+  fetchOtherSportsMatchesForFactory,
   fetchUpcomingMatchesForFactory,
   generateDailyPortfolioFromMatches,
   getDateKeyInTimezone,
@@ -21,7 +23,12 @@ import {
 import { evaluateTicketSettlement } from './settlementService.ts';
 
 function sleep(ms: number) {
+  if (process.env.NODE_ENV === 'test') return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTerminal(status: GeneratedTicket['status']): boolean {
+  return status === 'WON' || status === 'LOST' || status === 'VOID';
 }
 
 class SchedulerService {
@@ -46,8 +53,14 @@ class SchedulerService {
       this.bootTimer = setTimeout(() => {
         const cfg = automationStore.getFactoryConfig();
         if (cfg.enabled && !cfg.paused) {
-          const todayCount = this.getDailyTicketsCountToday(cfg.timezone);
-          if (todayCount < Math.min(cfg.maxTickets, cfg.dailyTicketTarget)) {
+          const counts = this.getSectionCountsToday(cfg.timezone);
+          const liveTarget = Math.max(10, cfg.liveFootballTarget ?? 12);
+          const otherTarget = Math.max(10, cfg.otherSportsTarget ?? 12);
+          if (
+            counts.upcomingActive < Math.min(cfg.maxTickets, cfg.dailyTicketTarget) ||
+            counts.liveFootballActive < liveTarget ||
+            counts.otherSportsActive < otherTarget
+          ) {
             void this.runDailyFactoryJob(false, null);
           }
         }
@@ -105,13 +118,42 @@ class SchedulerService {
       .filter((t) => t.generatedDateKey === todayKey).length;
   }
 
-  getStatus(): SchedulerStatus {
-    const cfg = automationStore.getFactoryConfig();
-    const meta = automationStore.getTimestamps();
-    const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
+  getSectionCountsToday(tz = 'Africa/Dar_es_Salaam'): {
+    totalToday: number;
+    upcomingTotal: number;
+    upcomingActive: number;
+    liveFootballTotal: number;
+    liveFootballActive: number;
+    otherSportsTotal: number;
+    otherSportsActive: number;
+  } {
+    const todayKey = getDateKeyInTimezone(Date.now(), tz);
     const todayTickets = automationStore
       .getTickets()
       .filter((t) => t.generatedDateKey === todayKey);
+
+    const upcoming = todayTickets.filter((t) => (t.feedSection || 'UPCOMING') === 'UPCOMING');
+    const liveFootball = todayTickets.filter((t) => t.feedSection === 'LIVE_FOOTBALL');
+    const otherSports = todayTickets.filter((t) => t.feedSection === 'OTHER_SPORTS');
+
+    return {
+      totalToday: todayTickets.length,
+      upcomingTotal: upcoming.length,
+      upcomingActive: upcoming.filter((t) => !isTerminal(t.status)).length,
+      liveFootballTotal: liveFootball.length,
+      liveFootballActive: liveFootball.filter((t) => !isTerminal(t.status)).length,
+      otherSportsTotal: otherSports.length,
+      otherSportsActive: otherSports.filter((t) => !isTerminal(t.status)).length,
+    };
+  }
+
+  getStatus(): SchedulerStatus {
+    const cfg = automationStore.getFactoryConfig();
+    const meta = automationStore.getTimestamps();
+    const allTickets = automationStore.getTickets();
+    const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
+    const todayTickets = allTickets.filter((t) => t.generatedDateKey === todayKey);
+    const counts = this.getSectionCountsToday(cfg.timezone);
 
     const nextRun =
       cfg.enabled && !cfg.paused && meta.lastFactoryRunAt
@@ -134,6 +176,12 @@ class SchedulerService {
       nextFactoryRunAt: nextRun,
       totalDailyTicketsToday: todayTickets.length,
       dailyTicketTarget: cfg.dailyTicketTarget,
+      liveFootballCount: counts.liveFootballTotal,
+      otherSportsCount: counts.otherSportsTotal,
+      upcomingActiveCount: counts.upcomingActive,
+      settledWonCount: allTickets.filter((t) => t.status === 'WON').length,
+      settledLostCount: allTickets.filter((t) => t.status === 'LOST').length,
+      settledVoidCount: allTickets.filter((t) => t.status === 'VOID').length,
       bookingCodesGeneratedToday: todayTickets.filter(
         (t) => t.bookingCodeStatus === 'GENERATED' && Boolean(t.shareCode)
       ).length,
@@ -146,7 +194,8 @@ class SchedulerService {
 
   private async revalidateAndPublishTickets(
     candidates: GeneratedTicket[],
-    cfg: DailyFactoryConfig
+    cfg: DailyFactoryConfig,
+    validationOptions?: { allowLive?: boolean; allowBothLiveAndUpcoming?: boolean }
   ): Promise<{
     publishedTickets: GeneratedTicket[];
     rejectedCount: number;
@@ -169,8 +218,8 @@ class SchedulerService {
     );
     const matchLookup = new Map<string, NormalizedMatch | null>();
 
-    for (let i = 0; i < uniqueEventIds.length; i += 10) {
-      const chunk = uniqueEventIds.slice(i, i + 10);
+    for (let i = 0; i < uniqueEventIds.length; i += 12) {
+      const chunk = uniqueEventIds.slice(i, i + 12);
       await Promise.all(
         chunk.map(async (eventId) => {
           try {
@@ -197,7 +246,8 @@ class SchedulerService {
         candidate.selections,
         matchLookup,
         cfg,
-        nowMs
+        nowMs,
+        validationOptions
       );
       if (!check.valid) {
         rejectedCount++;
@@ -243,8 +293,7 @@ class SchedulerService {
             bookingCodeError: null,
           };
           codesCreated++;
-          // Gentle pacing so upstream booking-code API stays unthrottled on 50+ ticket batches
-          await sleep(100);
+          await sleep(60);
         } catch (err) {
           codeFailures++;
           validatedTicket = {
@@ -345,14 +394,16 @@ class SchedulerService {
       return { tickets: [], log: skippedLog, shortfallReason: null };
     }
 
-    const existingToday = this.getDailyTicketsCountToday(cfg.timezone);
-    const cap = Math.min(cfg.maxTickets, cfg.dailyTicketTarget);
-    const remainingCapacity = manualTrigger
-      ? Math.max(0, cfg.maxTickets - existingToday)
-      : Math.max(0, cap - existingToday);
+    const counts = this.getSectionCountsToday(cfg.timezone);
+    const upcomingCap = Math.min(cfg.maxTickets, cfg.dailyTicketTarget);
+    const remainingUpcoming = Math.max(0, upcomingCap - counts.upcomingActive);
+    const liveTarget = Math.max(10, cfg.liveFootballTarget ?? 12);
+    const otherTarget = Math.max(10, cfg.otherSportsTarget ?? 12);
+    const remainingLiveFootball = Math.max(0, liveTarget - counts.liveFootballActive);
+    const remainingOtherSports = Math.max(0, otherTarget - counts.otherSportsActive);
 
-    if (remainingCapacity <= 0) {
-      const msg = `Daily ticket target already reached (${existingToday}/${cap} today in ${cfg.timezone}).`;
+    if (remainingUpcoming <= 0 && remainingLiveFootball <= 0 && remainingOtherSports <= 0) {
+      const msg = `Daily feed targets reached (${counts.upcomingActive}/${upcomingCap} upcoming active, ${counts.liveFootballActive}/${liveTarget} live football, ${counts.otherSportsActive}/${otherTarget} other sports).`;
       const log: AutomationJobLog = {
         logId: `log_${crypto.randomBytes(4).toString('hex')}`,
         actionType,
@@ -376,66 +427,142 @@ class SchedulerService {
 
     this.factoryLock = true;
     try {
-      const matches = await fetchUpcomingMatchesForFactory(cfg);
-      automationStore.setScanningAt(new Date().toISOString());
-
+      const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
+      const sourceType = manualTrigger ? 'ADMIN_MANUAL' : 'DAILY_FACTORY';
       const existingSignatures = cfg.duplicatePrevention
         ? automationStore.getExistingSignatures()
         : new Set<string>();
 
-      const batchTarget = manualTrigger
-        ? Math.min(remainingCapacity, cfg.dailyTicketTarget)
-        : remainingCapacity;
+      const allSaved: GeneratedTicket[] = [];
+      let totalCodesCreated = 0;
+      let totalCodeFailures = 0;
+      const shortfallNotes: string[] = [];
 
-      const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
-      const { eventIds: existingEventIds, teamKeys: existingTeamKeys } =
-        automationStore.getExistingEventAndTeamUsage(todayKey);
+      // 1. Upcoming Football Portfolio
+      if (remainingUpcoming > 0) {
+        const upcomingMatches = await fetchUpcomingMatchesForFactory(cfg);
+        automationStore.setScanningAt(new Date().toISOString());
+        const { eventIds: existingEventIds, teamKeys: existingTeamKeys } =
+          automationStore.getExistingEventAndTeamUsage(todayKey, 'UPCOMING');
 
-      const generated = generateDailyPortfolioFromMatches({
-        matches,
-        config: cfg,
-        targetCount: batchTarget,
-        sourceType: manualTrigger ? 'ADMIN_MANUAL' : 'DAILY_FACTORY',
-        existingSignatures,
-        existingEventIds,
-        existingTeamKeys,
-        nowMs: Date.now(),
-      });
+        const generated = generateDailyPortfolioFromMatches({
+          matches: upcomingMatches,
+          config: cfg,
+          targetCount: remainingUpcoming,
+          sourceType,
+          feedSection: 'UPCOMING',
+          existingSignatures,
+          existingEventIds,
+          existingTeamKeys,
+          nowMs: Date.now(),
+        });
 
-      const { publishedTickets, rejectedCount, codesCreated, codeFailures } =
-        await this.revalidateAndPublishTickets(generated.tickets, cfg);
+        const { publishedTickets, codesCreated, codeFailures } =
+          await this.revalidateAndPublishTickets(generated.tickets, cfg);
+        const saved = automationStore.addTickets(publishedTickets);
+        saved.forEach((t) => existingSignatures.add(t.signature));
+        allSaved.push(...saved);
+        totalCodesCreated += codesCreated;
+        totalCodeFailures += codeFailures;
+        if (generated.shortfallReason) shortfallNotes.push(`Upcoming: ${generated.shortfallReason}`);
+      }
 
-      const saved = automationStore.addTickets(publishedTickets);
+      // 2. Live Football Portfolio (10+ cards)
+      if (remainingLiveFootball > 0) {
+        const liveMatches = await fetchLiveFootballMatchesForFactory(cfg);
+        automationStore.setScanningAt(new Date().toISOString());
+        const { eventIds: liveEvIds, teamKeys: liveTeamKeys } =
+          automationStore.getExistingEventAndTeamUsage(todayKey, 'LIVE_FOOTBALL');
+
+        const generatedLive = generateDailyPortfolioFromMatches({
+          matches: liveMatches,
+          config: cfg,
+          targetCount: remainingLiveFootball,
+          sourceType,
+          feedSection: 'LIVE_FOOTBALL',
+          allowLive: true,
+          ignoreScheduleWindow: true,
+          existingSignatures,
+          existingEventIds: liveEvIds,
+          existingTeamKeys: liveTeamKeys,
+          nowMs: Date.now(),
+        });
+
+        const { publishedTickets, codesCreated, codeFailures } =
+          await this.revalidateAndPublishTickets(generatedLive.tickets, cfg, { allowLive: true });
+        const saved = automationStore.addTickets(publishedTickets);
+        saved.forEach((t) => existingSignatures.add(t.signature));
+        allSaved.push(...saved);
+        totalCodesCreated += codesCreated;
+        totalCodeFailures += codeFailures;
+        if (generatedLive.shortfallReason) {
+          shortfallNotes.push(`Live Football: ${generatedLive.shortfallReason}`);
+        }
+      }
+
+      // 3. Other Games Portfolio (Basketball, Hockey, Volleyball, Handball, Tennis, etc. - 10+ cards)
+      if (remainingOtherSports > 0) {
+        const otherMatches = await fetchOtherSportsMatchesForFactory(cfg);
+        automationStore.setScanningAt(new Date().toISOString());
+        const { eventIds: otherEvIds, teamKeys: otherTeamKeys } =
+          automationStore.getExistingEventAndTeamUsage(todayKey, 'OTHER_SPORTS');
+
+        const generatedOther = generateDailyPortfolioFromMatches({
+          matches: otherMatches,
+          config: cfg,
+          targetCount: remainingOtherSports,
+          sourceType,
+          feedSection: 'OTHER_SPORTS',
+          allowBothLiveAndUpcoming: true,
+          ignoreScheduleWindow: true,
+          skipMarketFilter: true,
+          existingSignatures,
+          existingEventIds: otherEvIds,
+          existingTeamKeys: otherTeamKeys,
+          nowMs: Date.now(),
+        });
+
+        const { publishedTickets, codesCreated, codeFailures } =
+          await this.revalidateAndPublishTickets(generatedOther.tickets, cfg, {
+            allowBothLiveAndUpcoming: true,
+          });
+        const saved = automationStore.addTickets(publishedTickets);
+        allSaved.push(...saved);
+        totalCodesCreated += codesCreated;
+        totalCodeFailures += codeFailures;
+        if (generatedOther.shortfallReason) {
+          shortfallNotes.push(`Other Games: ${generatedOther.shortfallReason}`);
+        }
+      }
+
       const finishedAt = new Date().toISOString();
-
-      const combinedShortfall =
-        generated.shortfallReason ||
-        (rejectedCount > 0
-          ? `${rejectedCount} candidate ticket(s) rejected during live pre-publish odds/status revalidation.`
-          : null);
-
+      const combinedShortfall = shortfallNotes.length > 0 ? shortfallNotes.join(' ') : null;
       automationStore.setFactoryRunMeta(finishedAt, combinedShortfall);
+
+      const upCount = allSaved.filter((t) => (t.feedSection || 'UPCOMING') === 'UPCOMING').length;
+      const lfCount = allSaved.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length;
+      const osCount = allSaved.filter((t) => t.feedSection === 'OTHER_SPORTS').length;
 
       const log: AutomationJobLog = {
         logId: `log_${crypto.randomBytes(4).toString('hex')}`,
         actionType,
         jobType: 'DAILY_FACTORY',
-        status: combinedShortfall ? 'PARTIAL' : 'SUCCESS',
+        status: combinedShortfall && allSaved.length === 0 ? 'PARTIAL' : combinedShortfall ? 'PARTIAL' : 'SUCCESS',
         actorEmail,
         startedAt,
         finishedAt,
         durationMs: Date.now() - startedMs,
-        ticketsGenerated: saved.length,
-        codesCreated,
-        codeFailures,
+        ticketsGenerated: allSaved.length,
+        codesCreated: totalCodesCreated,
+        codeFailures: totalCodeFailures,
         ticketsChecked: 0,
         ticketsSettled: 0,
-        message: combinedShortfall
-          ? `Published ${saved.length} validated ticket(s) (${codesCreated} genuine codes, ${codeFailures} code failures). ${combinedShortfall}`
-          : `Published ${saved.length} unique daily ticket(s) (${codesCreated} genuine codes, ${codeFailures} failures).`,
+        message: `Published ${allSaved.length} card(s) (${upCount} upcoming, ${lfCount} live football, ${osCount} other games; ${totalCodesCreated} genuine booking codes, ${totalCodeFailures} failures).${
+          combinedShortfall ? ` ${combinedShortfall}` : ''
+        }`,
       };
       automationStore.addLog(log);
-      return { tickets: saved, log, shortfallReason: combinedShortfall };
+      return { tickets: allSaved, log, shortfallReason: combinedShortfall };
     } catch (err) {
       const finishedAt = new Date().toISOString();
       const errMsg = err instanceof Error ? err.message : 'Daily Factory job failed';
@@ -462,6 +589,163 @@ class SchedulerService {
     }
   }
 
+  /**
+   * Automatically creates fresh replacement codes whenever existing codes finish (WON / LOST / VOID),
+   * preserving settled tickets in the feed untouched.
+   */
+  async replenishAfterSettlement(params: {
+    settledUpcomingTickets: GeneratedTicket[];
+    settledLiveFootball: number;
+    settledOtherSports: number;
+    cfg: DailyFactoryConfig;
+    actorEmail: string | null;
+  }): Promise<GeneratedTicket[]> {
+    const { settledUpcomingTickets, settledLiveFootball, settledOtherSports, cfg, actorEmail } =
+      params;
+    if (cfg.autoReplenishOnSettle === false) return [];
+    if (this.factoryLock) return [];
+
+    const liveTarget = Math.max(10, cfg.liveFootballTarget ?? 12);
+    const otherTarget = Math.max(10, cfg.otherSportsTarget ?? 12);
+    const counts = this.getSectionCountsToday(cfg.timezone);
+
+    const upcomingNeed = settledUpcomingTickets.length;
+    const liveNeed =
+      settledLiveFootball > 0 ? Math.max(0, liveTarget - counts.liveFootballActive) : 0;
+    const otherNeed =
+      settledOtherSports > 0 ? Math.max(0, otherTarget - counts.otherSportsActive) : 0;
+
+    if (upcomingNeed <= 0 && liveNeed <= 0 && otherNeed <= 0) {
+      return [];
+    }
+
+    this.factoryLock = true;
+    const replenished: GeneratedTicket[] = [];
+    try {
+      const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
+      const existingSignatures = cfg.duplicatePrevention
+        ? automationStore.getExistingSignatures()
+        : new Set<string>();
+
+      if (upcomingNeed > 0) {
+        const upcomingMatches = await fetchUpcomingMatchesForFactory(cfg);
+        const { eventIds, teamKeys } = automationStore.getExistingEventAndTeamUsage(
+          todayKey,
+          'UPCOMING'
+        );
+        const generated = generateDailyPortfolioFromMatches({
+          matches: upcomingMatches,
+          config: cfg,
+          targetCount: upcomingNeed,
+          sourceType: 'DAILY_FACTORY',
+          feedSection: 'UPCOMING',
+          replacedTicketId: settledUpcomingTickets[0]?.internalTicketId || null,
+          existingSignatures,
+          existingEventIds: eventIds,
+          existingTeamKeys: teamKeys,
+          nowMs: Date.now(),
+        });
+
+        // Tag each 1-to-1 replacement with its ended ancestor ID when matching count
+        const tagged = generated.tickets.map((t, idx) => ({
+          ...t,
+          replacedTicketId:
+            settledUpcomingTickets[idx]?.internalTicketId ||
+            settledUpcomingTickets[0]?.internalTicketId ||
+            null,
+        }));
+
+        const { publishedTickets } = await this.revalidateAndPublishTickets(tagged, cfg);
+        const saved = automationStore.addTickets(publishedTickets);
+        saved.forEach((t) => existingSignatures.add(t.signature));
+        replenished.push(...saved);
+      }
+
+      if (liveNeed > 0) {
+        const liveMatches = await fetchLiveFootballMatchesForFactory(cfg);
+        const { eventIds, teamKeys } = automationStore.getExistingEventAndTeamUsage(
+          todayKey,
+          'LIVE_FOOTBALL'
+        );
+        const generatedLive = generateDailyPortfolioFromMatches({
+          matches: liveMatches,
+          config: cfg,
+          targetCount: liveNeed,
+          sourceType: 'DAILY_FACTORY',
+          feedSection: 'LIVE_FOOTBALL',
+          allowLive: true,
+          ignoreScheduleWindow: true,
+          existingSignatures,
+          existingEventIds: eventIds,
+          existingTeamKeys: teamKeys,
+          nowMs: Date.now(),
+        });
+        const { publishedTickets } = await this.revalidateAndPublishTickets(
+          generatedLive.tickets,
+          cfg,
+          { allowLive: true }
+        );
+        const saved = automationStore.addTickets(publishedTickets);
+        saved.forEach((t) => existingSignatures.add(t.signature));
+        replenished.push(...saved);
+      }
+
+      if (otherNeed > 0) {
+        const otherMatches = await fetchOtherSportsMatchesForFactory(cfg);
+        const { eventIds, teamKeys } = automationStore.getExistingEventAndTeamUsage(
+          todayKey,
+          'OTHER_SPORTS'
+        );
+        const generatedOther = generateDailyPortfolioFromMatches({
+          matches: otherMatches,
+          config: cfg,
+          targetCount: otherNeed,
+          sourceType: 'DAILY_FACTORY',
+          feedSection: 'OTHER_SPORTS',
+          allowBothLiveAndUpcoming: true,
+          ignoreScheduleWindow: true,
+          skipMarketFilter: true,
+          existingSignatures,
+          existingEventIds: eventIds,
+          existingTeamKeys: teamKeys,
+          nowMs: Date.now(),
+        });
+        const { publishedTickets } = await this.revalidateAndPublishTickets(
+          generatedOther.tickets,
+          cfg,
+          { allowBothLiveAndUpcoming: true }
+        );
+        const saved = automationStore.addTickets(publishedTickets);
+        replenished.push(...saved);
+      }
+
+      if (replenished.length > 0) {
+        const nowIso = new Date().toISOString();
+        automationStore.addLog({
+          logId: `log_${crypto.randomBytes(4).toString('hex')}`,
+          actionType: 'AUTO_SCHEDULE',
+          jobType: 'DAILY_FACTORY',
+          status: 'SUCCESS',
+          actorEmail,
+          startedAt: nowIso,
+          finishedAt: nowIso,
+          durationMs: 0,
+          ticketsGenerated: replenished.length,
+          codesCreated: replenished.filter((t) => t.bookingCodeStatus === 'GENERATED').length,
+          codeFailures: replenished.filter((t) => t.bookingCodeStatus === 'FAILED').length,
+          ticketsChecked: 0,
+          ticketsSettled: 0,
+          message: `Auto-generated ${replenished.length} replacement code(s) after active daily codes settled.`,
+        });
+      }
+      return replenished;
+    } catch {
+      return replenished;
+    } finally {
+      this.factoryLock = false;
+    }
+  }
+
   async retryFailedBookingCodes(
     ticketIds?: string[],
     actorEmail: string | null = null
@@ -480,7 +764,7 @@ class SchedulerService {
         return false;
       }
       return (
-        t.status === 'PENDING' &&
+        !isTerminal(t.status) &&
         (!t.shareCode || t.bookingCodeStatus === 'FAILED' || t.bookingCodeStatus === 'NOT_REQUESTED')
       );
     });
@@ -516,7 +800,7 @@ class SchedulerService {
           lastCheckedAt: new Date().toISOString(),
         });
         codesCreated++;
-        await sleep(100);
+        await sleep(80);
       } catch (err) {
         codeFailures++;
         automationStore.updateTicketMutableFields({
@@ -562,7 +846,11 @@ class SchedulerService {
     manualTrigger = true,
     ticketIds?: string[],
     actorEmail: string | null = null
-  ): Promise<{ updatedTickets: GeneratedTicket[]; log: AutomationJobLog }> {
+  ): Promise<{
+    updatedTickets: GeneratedTicket[];
+    replenishedTickets: GeneratedTicket[];
+    log: AutomationJobLog;
+  }> {
     const startedMs = Date.now();
     const startedAt = new Date(startedMs).toISOString();
 
@@ -583,17 +871,18 @@ class SchedulerService {
         ticketsSettled: 0,
         message: 'Results tracker already running.',
       };
-      return { updatedTickets: [], log: skippedLog };
+      return { updatedTickets: [], replenishedTickets: [], log: skippedLog };
     }
 
     this.resultsLock = true;
     try {
+      const cfg = automationStore.getFactoryConfig();
       const allTickets = automationStore.getTickets();
       const targetTickets = allTickets.filter((t) => {
         if (ticketIds && ticketIds.length > 0 && !ticketIds.includes(t.internalTicketId)) {
           return false;
         }
-        return t.status !== 'WON' && t.status !== 'LOST' && t.status !== 'VOID';
+        return !isTerminal(t.status);
       });
 
       if (targetTickets.length === 0) {
@@ -616,7 +905,7 @@ class SchedulerService {
           message: 'No active pending or live tickets require settlement verification.',
         };
         if (manualTrigger) automationStore.addLog(log);
-        return { updatedTickets: [], log };
+        return { updatedTickets: [], replenishedTickets: [], log };
       }
 
       // Group active tickets by originating bookmaker so matches are queried strictly against each ticket's own platform
@@ -629,6 +918,9 @@ class SchedulerService {
       }
 
       const updatedTickets: GeneratedTicket[] = [];
+      const newlySettledUpcoming: GeneratedTicket[] = [];
+      let settledLiveFootball = 0;
+      let settledOtherSports = 0;
       let settledCount = 0;
       let totalUniqueEvents = 0;
 
@@ -642,7 +934,7 @@ class SchedulerService {
         const matchLookup = new Map<string, NormalizedMatch | null>();
 
         try {
-          const live = await client.getLiveMatches();
+          const live = await client.getLiveMatches('sr:sport:1');
           for (const m of live) {
             matchLookup.set(m.eventId, m);
           }
@@ -651,8 +943,8 @@ class SchedulerService {
         }
 
         const remainingIds = bkEventIds.filter((id) => !matchLookup.has(id));
-        for (let i = 0; i < remainingIds.length; i += 10) {
-          const chunk = remainingIds.slice(i, i + 10);
+        for (let i = 0; i < remainingIds.length; i += 12) {
+          const chunk = remainingIds.slice(i, i + 12);
           await Promise.all(
             chunk.map(async (eventId) => {
               try {
@@ -667,19 +959,38 @@ class SchedulerService {
 
         for (const ticket of bkTickets) {
           const evaluated = evaluateTicketSettlement(ticket, matchLookup, Date.now());
-          if (
-            evaluated.status === 'WON' ||
-            evaluated.status === 'LOST' ||
-            evaluated.status === 'VOID'
-          ) {
+          const reachedTerminal = isTerminal(evaluated.status);
+          if (reachedTerminal) {
             settledCount++;
           }
           const saved = automationStore.updateTicketMutableFields(evaluated);
-          if (saved) updatedTickets.push(saved);
+          if (saved) {
+            updatedTickets.push(saved);
+            if (reachedTerminal) {
+              const sec = saved.feedSection || 'UPCOMING';
+              if (sec === 'LIVE_FOOTBALL') {
+                settledLiveFootball++;
+              } else if (sec === 'OTHER_SPORTS') {
+                settledOtherSports++;
+              } else {
+                newlySettledUpcoming.push(saved);
+              }
+            }
+          }
         }
       }
 
-      const uniqueEventIds = { length: totalUniqueEvents };
+      // Auto-replenish new codes when active codes finish (WON / LOST / VOID)
+      let replenishedTickets: GeneratedTicket[] = [];
+      if (settledCount > 0 && cfg.autoReplenishOnSettle !== false) {
+        replenishedTickets = await this.replenishAfterSettlement({
+          settledUpcomingTickets: newlySettledUpcoming,
+          settledLiveFootball,
+          settledOtherSports,
+          cfg,
+          actorEmail,
+        });
+      }
 
       const finishedAt = new Date().toISOString();
       automationStore.setResultsRunAt(finishedAt);
@@ -693,15 +1004,19 @@ class SchedulerService {
         startedAt,
         finishedAt,
         durationMs: Date.now() - startedMs,
-        ticketsGenerated: 0,
-        codesCreated: 0,
-        codeFailures: 0,
+        ticketsGenerated: replenishedTickets.length,
+        codesCreated: replenishedTickets.filter((t) => t.bookingCodeStatus === 'GENERATED').length,
+        codeFailures: replenishedTickets.filter((t) => t.bookingCodeStatus === 'FAILED').length,
         ticketsChecked: updatedTickets.length,
         ticketsSettled: settledCount,
-        message: `Checked ${updatedTickets.length} active ticket(s) across ${uniqueEventIds.length} event(s); settled ${settledCount}.`,
+        message: `Checked ${updatedTickets.length} active ticket(s) across ${totalUniqueEvents} event(s); settled ${settledCount}.${
+          replenishedTickets.length > 0
+            ? ` Auto-generated ${replenishedTickets.length} fresh replacement code(s).`
+            : ''
+        }`,
       };
       automationStore.addLog(log);
-      return { updatedTickets, log };
+      return { updatedTickets, replenishedTickets, log };
     } catch (err) {
       const finishedAt = new Date().toISOString();
       const errMsg = err instanceof Error ? err.message : 'Results tracking failed';
@@ -722,7 +1037,7 @@ class SchedulerService {
         message: errMsg,
       };
       automationStore.addLog(log);
-      return { updatedTickets: [], log };
+      return { updatedTickets: [], replenishedTickets: [], log };
     } finally {
       this.resultsLock = false;
     }

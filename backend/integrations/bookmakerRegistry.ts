@@ -12,7 +12,7 @@ import { sportyBetClient, SportyBetIntegrationError } from './sportybetClient.ts
 
 export interface BookmakerClientAdapter {
   getLeagueDirectory(): Promise<LeagueDirectoryItem[]>;
-  getLiveMatches(): Promise<NormalizedMatch[]>;
+  getLiveMatches(sportId?: string): Promise<NormalizedMatch[]>;
   getUpcomingMatches(options?: {
     pageNum?: number;
     pageSize?: number;

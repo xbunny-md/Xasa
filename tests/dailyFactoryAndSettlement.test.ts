@@ -752,4 +752,237 @@ describe('Admin RBAC Check & Market Settlement Analytics', () => {
       ).status
     ).toBe('WON');
   });
+
+  it('generates 10+ LIVE_FOOTBALL and 10+ OTHER_SPORTS tickets without disallowed straight winner or 12 markets', () => {
+    const nowMs = Date.parse('2026-11-25T14:00:00.000Z');
+    const liveFootballMatches: NormalizedMatch[] = Array.from({ length: 24 }, (_, idx) =>
+      buildFixture(idx + 100, {
+        eventId: `sr:match:livefb_${idx}`,
+        sportId: 'sr:sport:1',
+        sportName: 'Football',
+        homeTeam: `LiveFBHome ${idx}`,
+        awayTeam: `LiveFBAway ${idx}`,
+        estimateStartTime: nowMs - 25 * 60 * 1000,
+        statusCode: 1,
+        matchStatus: 'H1',
+        isLive: true,
+      })
+    );
+
+    const cfg: DailyFactoryConfig = {
+      ...DEFAULT_DAILY_FACTORY_CONFIG,
+      dailyTicketTarget: 55,
+      liveFootballTarget: 12,
+      otherSportsTarget: 12,
+      minSelections: 2,
+      maxSelections: 5,
+      datePreset: 'CUSTOM',
+      customStartDate: '2026-11-25',
+      customEndDate: '2026-11-26',
+    };
+
+    const liveResult = generateDailyPortfolioFromMatches({
+      matches: liveFootballMatches,
+      config: cfg,
+      targetCount: 12,
+      feedSection: 'LIVE_FOOTBALL',
+      allowLive: true,
+      ignoreScheduleWindow: true,
+      nowMs,
+    });
+
+    expect(liveResult.tickets.length).toBeGreaterThanOrEqual(10);
+    expect(liveResult.tickets.every((t) => t.feedSection === 'LIVE_FOOTBALL')).toBe(true);
+    expect(liveResult.tickets.every((t) => isTicketAllowedInDailyFeed(t))).toBe(true);
+
+    const basketballMatches: NormalizedMatch[] = Array.from({ length: 24 }, (_, idx) => ({
+      ...buildFixture(idx + 300, {
+        eventId: `sr:match:bball_${idx}`,
+        sportId: 'sr:sport:2',
+        sportName: 'Basketball',
+        homeTeam: `HoopsHome ${idx}`,
+        awayTeam: `HoopsAway ${idx}`,
+        estimateStartTime: nowMs + 3600000 + idx * 60000,
+        isLive: idx < 6,
+        statusCode: idx < 6 ? 1 : 0,
+        matchStatus: idx < 6 ? 'Q2' : 'Not start',
+      }),
+      markets: [
+        {
+          marketId: '219',
+          name: 'Winner',
+          desc: 'Winner (incl. overtime)',
+          specifier: '',
+          status: 0,
+          banned: false,
+          sourceType: 'BET_RADAR',
+          lastOddsChangeTime: null,
+          outcomes: [
+            { outcomeId: '4', desc: 'Home', odds: 1.15, probability: 0.85, isActive: true },
+            { outcomeId: '5', desc: 'Away', odds: 4.5, probability: 0.15, isActive: true },
+          ],
+        },
+        {
+          marketId: '225',
+          name: 'Total (incl. overtime)',
+          desc: 'Total (incl. overtime)',
+          specifier: 'total=145.5',
+          status: 0,
+          banned: false,
+          sourceType: 'BET_RADAR',
+          lastOddsChangeTime: null,
+          outcomes: [
+            { outcomeId: '12', desc: 'Over 145.5', odds: 1.18, probability: 0.82, isActive: true },
+            { outcomeId: '13', desc: 'Under 145.5', odds: 4.2, probability: 0.18, isActive: true },
+          ],
+        },
+        {
+          marketId: '225',
+          name: 'Total (incl. overtime)',
+          desc: 'Total (incl. overtime)',
+          specifier: 'total=175.5',
+          status: 0,
+          banned: false,
+          sourceType: 'BET_RADAR',
+          lastOddsChangeTime: null,
+          outcomes: [
+            { outcomeId: '12_hi', desc: 'Over 175.5', odds: 3.9, probability: 0.2, isActive: true },
+            { outcomeId: '13_hi', desc: 'Under 175.5', odds: 1.21, probability: 0.8, isActive: true },
+          ],
+        },
+      ],
+    }));
+
+    const otherResult = generateDailyPortfolioFromMatches({
+      matches: basketballMatches,
+      config: cfg,
+      targetCount: 12,
+      feedSection: 'OTHER_SPORTS',
+      allowBothLiveAndUpcoming: true,
+      ignoreScheduleWindow: true,
+      skipMarketFilter: true,
+      nowMs,
+    });
+
+    expect(otherResult.tickets.length).toBeGreaterThanOrEqual(10);
+    expect(otherResult.tickets.every((t) => t.feedSection === 'OTHER_SPORTS')).toBe(true);
+    expect(otherResult.tickets.every((t) => t.sportId === 'sr:sport:2')).toBe(true);
+    expect(
+      otherResult.tickets.every((t) =>
+        t.selections.every((s) => s.marketId === '225' && !isDisallowedDailyFeedSelection(s))
+      )
+    ).toBe(true);
+
+    // Multi-sport settlement & set-score guard for Tennis
+    expect(
+      settleSingleSelectionOutcome(
+        {
+          sportId: 'sr:sport:2',
+          marketId: '225',
+          outcomeId: '12',
+          outcomeDesc: 'Over 145.5',
+          specifier: 'total=145.5',
+        },
+        { homeGoals: 82, awayGoals: 78 }
+      ).status
+    ).toBe('WON');
+
+    expect(
+      settleSingleSelectionOutcome(
+        {
+          sportId: 'sr:sport:5',
+          marketId: '238',
+          outcomeId: '12',
+          outcomeDesc: 'Over 21.5',
+          specifier: 'total=21.5',
+        },
+        { homeGoals: 2, awayGoals: 1 } // Set score cannot settle total games line >= 12
+      ).status
+    ).toBe('UNVERIFIED');
+  });
+
+  it('locks WON/LOST/VOID tickets in automationStore and hydrates cold-start tickets cleanly', () => {
+    const nowMs = Date.parse('2026-11-25T06:00:00.000Z');
+    const [sample] = generateDailyPortfolioFromMatches({
+      matches: [buildFixture(1), buildFixture(2), buildFixture(3)],
+      config: {
+        ...DEFAULT_DAILY_FACTORY_CONFIG,
+        datePreset: 'CUSTOM',
+        customStartDate: '2026-11-25',
+        customEndDate: '2026-11-26',
+        oddsCategories: [
+          {
+            id: 'cat_lock',
+            label: '1.20–2.50',
+            minCombinedOdds: 1.2,
+            maxCombinedOdds: 2.5,
+            targetCombinedOdds: 1.5,
+            weight: 100,
+          },
+        ],
+      },
+      targetCount: 1,
+      feedSection: 'UPCOMING',
+      nowMs,
+    }).tickets;
+
+    expect(sample).toBeDefined();
+
+    const ticketId = 'LOCK-TEST-901';
+    const wonTicket: GeneratedTicket = {
+      ...sample,
+      internalTicketId: ticketId,
+      signature: 'sig_lock_test_901',
+      status: 'WON',
+      settledAt: '2026-11-25T18:00:00.000Z',
+    };
+
+    automationStore.addTickets([wonTicket]);
+    // Attempt to downgrade terminal WON back to PENDING or LOST
+    const afterUpdate = automationStore.updateTicketMutableFields({
+      ...wonTicket,
+      status: 'LOST',
+    });
+    expect(afterUpdate?.status).toBe('WON');
+
+    // Replacement ticket can be generated for remaining unused upcoming matches with ancestor link
+    const replenishment = generateDailyPortfolioFromMatches({
+      matches: [buildFixture(1), buildFixture(2), buildFixture(3), buildFixture(4), buildFixture(5)],
+      config: {
+        ...DEFAULT_DAILY_FACTORY_CONFIG,
+        datePreset: 'CUSTOM',
+        customStartDate: '2026-11-25',
+        customEndDate: '2026-11-26',
+        oddsCategories: [
+          {
+            id: 'cat_lock',
+            label: '1.20–2.50',
+            minCombinedOdds: 1.2,
+            maxCombinedOdds: 2.5,
+            targetCombinedOdds: 1.5,
+            weight: 100,
+          },
+        ],
+      },
+      targetCount: 1,
+      feedSection: 'UPCOMING',
+      replacedTicketId: ticketId,
+      existingSignatures: new Set([wonTicket.signature, sample.signature]),
+      existingEventIds: new Set(sample.selections.map((s) => s.eventId)),
+      nowMs,
+    });
+    expect(replenishment.tickets.length).toBe(1);
+    expect(replenishment.tickets[0].replacedTicketId).toBe(ticketId);
+    expect(replenishment.tickets[0].feedSection).toBe('UPCOMING');
+
+    // Delete from memory, then cold-start hydrate
+    automationStore.deleteTicket(ticketId);
+    expect(automationStore.getTicketById(ticketId)).toBeUndefined();
+
+    const hydratedCount = automationStore.hydrateTickets([wonTicket]);
+    expect(hydratedCount).toBe(1);
+    expect(automationStore.getTicketById(ticketId)?.status).toBe('WON');
+
+    automationStore.deleteTicket(ticketId);
+  });
 });

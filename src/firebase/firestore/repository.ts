@@ -17,11 +17,15 @@ import type {
   BookingCodeResponse,
   BookingCodeStatus,
   DailyFactoryConfig,
+  FeedSection,
   GeneratedTicket,
   MatchStatusFilter,
   QualifyingSelection,
   ScanResult,
+  SelectionSettlementRecord,
   ThemeMode,
+  TicketSelectionRecord,
+  TicketStatus,
   TransferDirection,
   TransferStatus,
 } from '../../types/sportybet.ts';
@@ -150,6 +154,11 @@ export interface PublicTicketDocRecord {
   publishedByUid: string;
   internalTicketId: string;
   signature: string;
+  bookmakerId?: BookmakerId;
+  feedSection?: FeedSection;
+  sportId?: string;
+  sportName?: string;
+  replacedTicketId?: string;
   sourceType: 'DAILY_FACTORY' | 'ADMIN_MANUAL';
   categoryId: string;
   categoryLabel: string;
@@ -168,7 +177,7 @@ export interface PublicTicketUpdateDocRecord {
   id: string;
   isPublic: boolean;
   internalTicketId: string;
-  status: string;
+  status: TicketStatus | string;
   effectiveCombinedOdds: number;
   shareCode: string;
   shareUrl: string;
@@ -187,9 +196,13 @@ export interface AdminSettingsDocRecord {
   updatedByEmail: string;
   enabled: boolean;
   paused: boolean;
+  activeBookmaker?: BookmakerId;
   minIndividualOdds: number;
   maxIndividualOdds: number;
   dailyTicketTarget: number;
+  liveFootballTarget?: number;
+  otherSportsTarget?: number;
+  autoReplenishOnSettle?: boolean;
   maxTickets: number;
   minSelections: number;
   maxSelections: number;
@@ -209,6 +222,12 @@ export interface PublicStatsDocRecord {
   dailyTicketTarget: number;
   totalGeneratedToday: number;
   bookingCodesGeneratedToday: number;
+  liveFootballCount?: number;
+  otherSportsCount?: number;
+  upcomingActiveCount?: number;
+  settledWonCount?: number;
+  settledLostCount?: number;
+  settledVoidCount?: number;
   lastScanningAt: string;
   lastSettlementAt: string;
   updatedAt?: Timestamp | string;
@@ -664,12 +683,21 @@ export async function syncPublicTicketBundle(
   try {
     const existingTicket = await getDoc(ticketRef);
     if (!existingTicket.exists()) {
-      await setDoc(ticketRef, {
+      const feedSection: FeedSection =
+        ticket.feedSection === 'LIVE_FOOTBALL' || ticket.feedSection === 'OTHER_SPORTS'
+          ? ticket.feedSection
+          : 'UPCOMING';
+      const cleanSportId = clampString(ticket.sportId || '', 40);
+      const cleanSportName = clampString(ticket.sportName || '', 60);
+      const cleanReplacedId = clampString(ticket.replacedTicketId || '', 64);
+
+      const ticketPayload: Record<string, unknown> = {
         isPublic: true,
         publishedByUid: adminUid,
         internalTicketId: safeId,
         signature: clampString(ticket.signature, 160, safeId),
         bookmakerId: ticket.bookmakerId === 'BETPAWA_TZ' ? 'BETPAWA_TZ' : 'SPORTYBET_TZ',
+        feedSection,
         sourceType: ticket.sourceType === 'ADMIN_MANUAL' ? 'ADMIN_MANUAL' : 'DAILY_FACTORY',
         categoryId: clampString(ticket.categoryId, 40, 'cat_2_3'),
         categoryLabel: clampString(ticket.categoryLabel, 60, '2.00-3.00'),
@@ -685,7 +713,13 @@ export async function syncPublicTicketBundle(
         generatedDateKey: clampString(ticket.generatedDateKey, 20, '2026-01-01'),
         originalSelections: ticket.selections.slice(0, 30),
         createdAt: serverTimestamp(),
-      });
+      };
+
+      if (cleanSportId) ticketPayload.sportId = cleanSportId;
+      if (cleanSportName) ticketPayload.sportName = cleanSportName;
+      if (cleanReplacedId) ticketPayload.replacedTicketId = cleanReplacedId;
+
+      await setDoc(ticketRef, ticketPayload);
     }
 
     const existingUpdate = await getDoc(updateRef);
@@ -756,6 +790,15 @@ export async function saveAdminSettingsRecord(
       minIndividualOdds: minOdds,
       maxIndividualOdds: maxOdds,
       dailyTicketTarget: Math.max(1, Math.min(200, Math.round(cfg.dailyTicketTarget))),
+      liveFootballTarget: Math.max(
+        10,
+        Math.min(100, Math.round(Number(cfg.liveFootballTarget ?? 12)))
+      ),
+      otherSportsTarget: Math.max(
+        10,
+        Math.min(100, Math.round(Number(cfg.otherSportsTarget ?? 12)))
+      ),
+      autoReplenishOnSettle: cfg.autoReplenishOnSettle !== false,
       maxTickets: Math.max(1, Math.min(200, Math.round(cfg.maxTickets))),
       minSelections,
       maxSelections,
@@ -788,6 +831,12 @@ export async function savePublicStatsRecord(stats: {
   dailyTicketTarget: number;
   totalGeneratedToday: number;
   bookingCodesGeneratedToday: number;
+  liveFootballCount?: number;
+  otherSportsCount?: number;
+  upcomingActiveCount?: number;
+  settledWonCount?: number;
+  settledLostCount?: number;
+  settledVoidCount?: number;
   lastScanningAt: string | null;
   lastSettlementAt: string | null;
 }): Promise<void> {
@@ -796,11 +845,17 @@ export async function savePublicStatsRecord(stats: {
     await setDoc(doc(db, 'publicStats', 'daily'), {
       isPublic: true,
       dailyTicketTarget: Math.max(1, Math.min(200, Math.round(stats.dailyTicketTarget))),
-      totalGeneratedToday: Math.max(0, Math.min(500, Math.round(stats.totalGeneratedToday))),
+      totalGeneratedToday: Math.max(0, Math.min(1000, Math.round(stats.totalGeneratedToday))),
       bookingCodesGeneratedToday: Math.max(
         0,
-        Math.min(500, Math.round(stats.bookingCodesGeneratedToday))
+        Math.min(1000, Math.round(stats.bookingCodesGeneratedToday))
       ),
+      liveFootballCount: Math.max(0, Math.min(500, Math.round(stats.liveFootballCount ?? 0))),
+      otherSportsCount: Math.max(0, Math.min(500, Math.round(stats.otherSportsCount ?? 0))),
+      upcomingActiveCount: Math.max(0, Math.min(500, Math.round(stats.upcomingActiveCount ?? 0))),
+      settledWonCount: Math.max(0, Math.min(5000, Math.round(stats.settledWonCount ?? 0))),
+      settledLostCount: Math.max(0, Math.min(5000, Math.round(stats.settledLostCount ?? 0))),
+      settledVoidCount: Math.max(0, Math.min(5000, Math.round(stats.settledVoidCount ?? 0))),
       lastScanningAt: clampString(stats.lastScanningAt || '', 40),
       lastSettlementAt: clampString(stats.lastSettlementAt || '', 40),
       updatedAt: serverTimestamp(),
@@ -834,4 +889,77 @@ export async function saveAdminAuditLogRecord(
   }
 }
 
+function timestampToIso(val: Timestamp | string | undefined | null, fallback = ''): string {
+  if (!val) return fallback;
+  if (typeof val === 'string') return val;
+  if (typeof (val as { toDate?: () => Date }).toDate === 'function') {
+    return (val as { toDate: () => Date }).toDate().toISOString();
+  }
+  return fallback;
+}
+
+export function mapPublicDocsToGeneratedTickets(
+  ticketDocs: PublicTicketDocRecord[],
+  updateDocs: PublicTicketUpdateDocRecord[]
+): GeneratedTicket[] {
+  const updateMap = new Map<string, PublicTicketUpdateDocRecord>();
+  for (const upd of updateDocs) {
+    const key = upd.internalTicketId || upd.id;
+    if (key) updateMap.set(key, upd);
+  }
+
+  return ticketDocs.map((docItem) => {
+    const ticketId = docItem.internalTicketId || docItem.id;
+    const upd = updateMap.get(ticketId);
+    const bkId: BookmakerId =
+      docItem.bookmakerId === 'BETPAWA_TZ' ? 'BETPAWA_TZ' : 'SPORTYBET_TZ';
+    const createdAtIso = timestampToIso(docItem.createdAt, `${docItem.generatedDateKey}T00:00:00.000Z`);
+    const updatedAtIso = timestampToIso(upd?.updatedAt, createdAtIso);
+
+    const status = (upd?.status as TicketStatus) || 'PENDING';
+    const actualCombinedOdds = Number(docItem.actualCombinedOdds || 1);
+    const targetOdds = Number(docItem.targetOdds || actualCombinedOdds);
+
+    return {
+      internalTicketId: ticketId,
+      bookmakerId: bkId,
+      bookmakerName: bkId === 'BETPAWA_TZ' ? 'betPawa Tanzania' : 'SportyBet Tanzania',
+      bookmakerUrl:
+        bkId === 'BETPAWA_TZ' ? 'https://www.betpawa.co.tz/bets' : 'https://www.sportybet.com/tz/m/',
+      feedSection: docItem.feedSection || 'UPCOMING',
+      sportId: docItem.sportId,
+      sportName: docItem.sportName,
+      replacedTicketId: docItem.replacedTicketId || null,
+      signature: docItem.signature,
+      sourceType: docItem.sourceType || 'DAILY_FACTORY',
+      categoryId: docItem.categoryId,
+      categoryLabel: docItem.categoryLabel,
+      targetOdds,
+      actualCombinedOdds,
+      oddsDifference: Number(Math.abs(targetOdds - actualCombinedOdds).toFixed(3)),
+      selectionCount: Number(docItem.selectionCount || docItem.originalSelections?.length || 0),
+      selections: (docItem.originalSelections || []) as unknown as TicketSelectionRecord[],
+      kickoffStartMs: Number(docItem.kickoffStartMs || 0),
+      kickoffEndMs: Number(docItem.kickoffEndMs || docItem.kickoffStartMs || 0),
+      dataSource: docItem.dataSource || 'SportyBet TZ',
+      generatedAt: createdAtIso,
+      generatedDateKey: docItem.generatedDateKey,
+      published: true,
+      revalidatedAt: createdAtIso,
+      status,
+      effectiveCombinedOdds: Number(upd?.effectiveCombinedOdds ?? actualCombinedOdds),
+      selectionSettlements: (upd?.selectionSettlements || []) as unknown as SelectionSettlementRecord[],
+      shareCode: upd?.shareCode ? upd.shareCode : null,
+      shareUrl: upd?.shareUrl ? upd.shareUrl : null,
+      shareCodeDeadline: null,
+      shareCodeVerified: Boolean(upd?.shareCodeVerified),
+      bookingCodeStatus: upd?.bookingCodeStatus || (upd?.shareCode ? 'GENERATED' : 'NOT_REQUESTED'),
+      bookingCodeError: upd?.bookingCodeError ? upd.bookingCodeError : null,
+      settledAt: upd?.settledAt ? upd.settledAt : null,
+      lastCheckedAt: updatedAtIso || null,
+    };
+  });
+}
+
 export { collection };
+

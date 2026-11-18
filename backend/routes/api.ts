@@ -25,6 +25,7 @@ import {
   getTransferMarkets,
   getUpcomingMatches,
   getUserTransferHistory,
+  hydrateTicketsHandler,
   listPublicTickets,
   previewTransfer,
   recordAuthAudit,
@@ -105,6 +106,7 @@ apiRouter.post(
   createTicketBookingCode
 );
 apiRouter.post('/tickets/retry-booking-codes', requireAdmin, retryFailedBookingCodesHandler);
+apiRouter.post('/tickets/hydrate', requireAdmin, hydrateTicketsHandler);
 apiRouter.post('/tickets/track-results', requireAdmin, trackTicketsResults);
 apiRouter.post('/scheduler/results-run', requireAdmin, trackTicketsResults);
 

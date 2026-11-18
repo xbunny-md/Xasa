@@ -39,6 +39,7 @@ export function TicketDetailsPage() {
   const { isAdmin } = useFirebase();
   const {
     selectedTicket,
+    openTicketDetails,
     closeTicketDetails,
     isTicketFavorited,
     toggleFavoriteTicket,
@@ -214,8 +215,13 @@ export function TicketDetailsPage() {
           <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 dark:border-white/[0.06] pb-4">
             <div>
               <span className="font-mono text-xs text-blue-700 dark:text-blue-300">
-                {ticketBookmakerName} · {selectedTicket.categoryLabel} Odds Category ·{' '}
-                {selectedTicket.internalTicketId}
+                {ticketBookmakerName} ·{' '}
+                {selectedTicket.feedSection === 'LIVE_FOOTBALL'
+                  ? 'Live Football'
+                  : selectedTicket.feedSection === 'OTHER_SPORTS'
+                    ? selectedTicket.sportName || 'Other Games'
+                    : 'Upcoming Football'}{' '}
+                · {selectedTicket.categoryLabel} · {selectedTicket.internalTicketId}
               </span>
               <h2 className="text-2xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">
                 {selectedTicket.actualCombinedOdds.toFixed(2)} Combined Odds
@@ -225,6 +231,15 @@ export function TicketDetailsPage() {
                   Effective Settled Odds (after void adjustment):{' '}
                   {selectedTicket.effectiveCombinedOdds.toFixed(2)}
                 </p>
+              )}
+              {selectedTicket.replacedTicketId && (
+                <button
+                  type="button"
+                  onClick={() => openTicketDetails(selectedTicket.replacedTicketId!)}
+                  className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-mono text-cyan-700 dark:text-cyan-300 hover:underline"
+                >
+                  Auto-replenished after ended ticket #{selectedTicket.replacedTicketId}
+                </button>
               )}
             </div>
 
@@ -239,6 +254,13 @@ export function TicketDetailsPage() {
               >
                 {selectedTicket.status}
               </span>
+              {(selectedTicket.status === 'WON' ||
+                selectedTicket.status === 'LOST' ||
+                selectedTicket.status === 'VOID') && (
+                <span className="block text-[10px] font-mono text-slate-500 dark:text-slate-400 mt-0.5">
+                  Locked in Firebase
+                </span>
+              )}
             </div>
           </div>
 

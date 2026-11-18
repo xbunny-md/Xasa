@@ -49,7 +49,7 @@ export function isMatchLiveStatus(
 export function settleSingleSelectionOutcome(
   sel: Pick<
     TicketSelectionRecord,
-    'marketId' | 'outcomeId' | 'outcomeDesc' | 'specifier'
+    'marketId' | 'outcomeId' | 'outcomeDesc' | 'specifier' | 'sportId'
   >,
   score: ParsedScore
 ): { status: SelectionSettlementStatus; reason: string } {
@@ -104,8 +104,15 @@ export function settleSingleSelectionOutcome(
     }
   }
 
-  // 18 / 5000: Total Goals Over/Under
-  if (marketId === '18' || marketId === '5000') {
+  // 18 / 5000 / 225 / 238 / 236 / 189: Total Goals / Points Over/Under
+  if (
+    marketId === '18' ||
+    marketId === '5000' ||
+    marketId === '225' ||
+    marketId === '238' ||
+    marketId === '236' ||
+    marketId === '189'
+  ) {
     const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
     const descMatch = /(over|under)\s*(\d+(?:\.\d+)?)/i.exec(desc);
     const line = specMatch ? Number(specMatch[1]) : descMatch ? Number(descMatch[2]) : NaN;
@@ -113,6 +120,16 @@ export function settleSingleSelectionOutcome(
     const isUnder = outcomeId === '13' || /\bunder\b/i.test(desc);
 
     if (Number.isFinite(line) && (isOver || isUnder)) {
+      const sportId = (sel as { sportId?: string }).sportId || '';
+      const isSetScoredSport =
+        sportId === 'sr:sport:5' || sportId === 'sr:sport:20' || sportId === 'sr:sport:23';
+      // Guard against set-only summary scores (e.g. 2:1) being compared to large point/game totals (e.g. 178.5)
+      if (isSetScoredSport && line >= 12 && totalGoals <= 7) {
+        return {
+          status: 'UNVERIFIED',
+          reason: `Set score ${homeGoals}:${awayGoals} cannot verify total points/games line ${line} — requires detailed point count.`,
+        };
+      }
       if (totalGoals === line) {
         return {
           status: 'VOID',
@@ -127,14 +144,14 @@ export function settleSingleSelectionOutcome(
     }
   }
 
-  // 5006 / 5003: betPawa Team Total Goals Over/Under (Home / Away)
-  if (marketId === '5006' || marketId === '5003') {
-    const teamGoals = marketId === '5006' ? homeGoals : awayGoals;
+  // 19 / 20 / 5006 / 5003: Team Total Goals/Points Over/Under (Home / Away)
+  if (marketId === '19' || marketId === '20' || marketId === '5006' || marketId === '5003') {
+    const teamGoals = marketId === '19' || marketId === '5006' ? homeGoals : awayGoals;
     const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
     const descMatch = /(over|under)\s*(\d+(?:\.\d+)?)/i.exec(desc);
     const line = specMatch ? Number(specMatch[1]) : descMatch ? Number(descMatch[2]) : NaN;
-    const isOver = /\bover\b/i.test(desc);
-    const isUnder = /\bunder\b/i.test(desc);
+    const isOver = outcomeId === '12' || /\bover\b/i.test(desc);
+    const isUnder = outcomeId === '13' || /\bunder\b/i.test(desc);
     if (Number.isFinite(line) && (isOver || isUnder)) {
       if (teamGoals === line) {
         return { status: 'VOID', reason: `FT ${homeGoals}:${awayGoals} (Team total pushes ${line})` };
@@ -142,7 +159,7 @@ export function settleSingleSelectionOutcome(
       const won = isOver ? teamGoals > line : teamGoals < line;
       return {
         status: won ? 'WON' : 'LOST',
-        reason: `FT ${homeGoals}:${awayGoals} (Team goals ${teamGoals} vs ${isOver ? 'Over' : 'Under'} ${line})`,
+        reason: `FT ${homeGoals}:${awayGoals} (Team total ${teamGoals} vs ${isOver ? 'Over' : 'Under'} ${line})`,
       };
     }
   }

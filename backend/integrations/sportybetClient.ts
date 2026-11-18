@@ -48,6 +48,8 @@ interface RawEvent {
     liveSource?: { sourceType?: string };
   };
   sport?: {
+    id?: string;
+    name?: string;
     category?: {
       id?: string;
       name?: string;
@@ -58,6 +60,17 @@ interface RawEvent {
     };
   };
 }
+
+export const SPORTYBET_SPORT_NAMES: Record<string, string> = {
+  'sr:sport:1': 'Football',
+  'sr:sport:2': 'Basketball',
+  'sr:sport:4': 'Ice Hockey',
+  'sr:sport:5': 'Tennis',
+  'sr:sport:6': 'Handball',
+  'sr:sport:20': 'Table Tennis',
+  'sr:sport:21': 'Cricket',
+  'sr:sport:23': 'Volleyball',
+};
 
 interface RawTournamentBucket {
   id?: string;
@@ -194,7 +207,8 @@ export class SportyBetClient {
     raw: RawEvent,
     tournamentMeta: { id?: string; name?: string; categoryId?: string; categoryName?: string },
     isLive: boolean,
-    retrievedAt: string
+    retrievedAt: string,
+    fallbackSportId?: string
   ): NormalizedMatch | null {
     if (!raw || !raw.eventId || !raw.homeTeamName || !raw.awayTeamName) return null;
     const estimateStartTime = Number(raw.estimateStartTime || 0);
@@ -207,6 +221,10 @@ export class SportyBetClient {
     const cat = raw.sport?.category;
     const tour = cat?.tournament;
 
+    const sportId = String(raw.sport?.id || fallbackSportId || SPORTYBET_CONFIG.sportIdFootball);
+    const sportName = String(
+      raw.sport?.name || SPORTYBET_SPORT_NAMES[sportId] || 'Football'
+    );
     const leagueId = String(tournamentMeta.id || tour?.id || 'unknown');
     const leagueName = String(tournamentMeta.name || tour?.name || 'Unknown League');
     const countryId = String(tournamentMeta.categoryId || cat?.id || 'unknown');
@@ -221,6 +239,8 @@ export class SportyBetClient {
     return {
       bookmakerId: 'SPORTYBET_TZ',
       bookmakerName: 'SportyBet Tanzania',
+      sportId,
+      sportName,
       eventId: String(raw.eventId),
       gameId: String(raw.gameId || ''),
       homeTeam: String(raw.homeTeamName),
@@ -300,13 +320,14 @@ export class SportyBetClient {
     return items;
   }
 
-  async getLiveMatches(): Promise<NormalizedMatch[]> {
-    const cacheKey = 'live_football';
+  async getLiveMatches(sportId = SPORTYBET_CONFIG.sportIdFootball): Promise<NormalizedMatch[]> {
+    const cleanSportId = sportId || SPORTYBET_CONFIG.sportIdFootball;
+    const cacheKey = `live_${cleanSportId}`;
     const cached = this.getCached<NormalizedMatch[]>(cacheKey);
     if (cached) return cached;
 
     const url = `${SPORTYBET_CONFIG.baseUrl}/factsCenter/liveOrPrematchEvents?sportId=${encodeURIComponent(
-      SPORTYBET_CONFIG.sportIdFootball
+      cleanSportId
     )}&_t=${Date.now()}`;
 
     const { json } = await this.fetchJson<{
@@ -329,7 +350,7 @@ export class SportyBetClient {
 
     for (const bucket of json.data || []) {
       for (const ev of bucket.events || []) {
-        const normalized = this.normalizeEvent(ev, bucket, true, retrievedAt);
+        const normalized = this.normalizeEvent(ev, bucket, true, retrievedAt, cleanSportId);
         if (normalized && !seen.has(normalized.eventId)) {
           seen.add(normalized.eventId);
           matches.push(normalized);
@@ -352,7 +373,7 @@ export class SportyBetClient {
   }): Promise<{ matches: NormalizedMatch[]; totalAvailable: number }> {
     const pageNum = options?.pageNum ?? 1;
     const pageSize = Math.min(Math.max(options?.pageSize ?? 100, 10), 100);
-    const maxPages = Math.min(Math.max(options?.maxPages ?? 1, 1), 10);
+    const maxPages = Math.min(Math.max(options?.maxPages ?? 1, 1), 12);
     const marketIds = options?.marketIds || SPORTYBET_CONFIG.defaultMarketIds;
     const todayGames = options?.todayGames ? '&todayGames=true' : '';
     const sportId = options?.sportId || SPORTYBET_CONFIG.sportIdFootball;
@@ -368,7 +389,7 @@ export class SportyBetClient {
     let totalAvailable = 0;
     const retrievedAt = new Date().toISOString();
 
-    for (let p = pageNum; p < pageNum + maxPages; p++) {
+    const fetchPage = async (p: number) => {
       const url = `${SPORTYBET_CONFIG.baseUrl}/factsCenter/pcUpcomingEvents?sportId=${encodeURIComponent(
         sportId
       )}&marketId=${encodeURIComponent(marketIds)}&pageSize=${pageSize}&pageNum=${p}${todayGames}`;
@@ -389,24 +410,47 @@ export class SportyBetClient {
           json.bizCode
         );
       }
+      return json;
+    };
 
-      totalAvailable = Number(json.data?.totalNum || 0);
-      const buckets = json.data?.tournaments || [];
-      let pageEventCount = 0;
-
-      for (const bucket of buckets) {
-        for (const ev of bucket.events || []) {
-          pageEventCount++;
-          const normalized = this.normalizeEvent(ev, bucket, false, retrievedAt);
-          if (normalized && !seen.has(normalized.eventId)) {
-            seen.add(normalized.eventId);
-            matches.push(normalized);
-          }
+    const firstJson = await fetchPage(pageNum);
+    totalAvailable = Number(firstJson.data?.totalNum || 0);
+    let firstCount = 0;
+    for (const bucket of firstJson.data?.tournaments || []) {
+      for (const ev of bucket.events || []) {
+        firstCount++;
+        const normalized = this.normalizeEvent(ev, bucket, false, retrievedAt, sportId);
+        if (normalized && !seen.has(normalized.eventId)) {
+          seen.add(normalized.eventId);
+          matches.push(normalized);
         }
       }
+    }
 
-      if (pageEventCount === 0 || matches.length >= totalAvailable) {
-        break;
+    const totalPagesNeeded =
+      totalAvailable > 0
+        ? Math.min(maxPages, Math.ceil(totalAvailable / pageSize))
+        : maxPages;
+
+    if (firstCount > 0 && totalPagesNeeded > 1) {
+      const pageNumbers = Array.from(
+        { length: totalPagesNeeded - 1 },
+        (_, idx) => pageNum + idx + 1
+      );
+      const restPages = await Promise.all(
+        pageNumbers.map((p) => fetchPage(p).catch(() => null))
+      );
+      for (const pageJson of restPages) {
+        if (!pageJson) continue;
+        for (const bucket of pageJson.data?.tournaments || []) {
+          for (const ev of bucket.events || []) {
+            const normalized = this.normalizeEvent(ev, bucket, false, retrievedAt, sportId);
+            if (normalized && !seen.has(normalized.eventId)) {
+              seen.add(normalized.eventId);
+              matches.push(normalized);
+            }
+          }
+        }
       }
     }
 
@@ -474,7 +518,7 @@ export class SportyBetClient {
         marketId: String(s.marketId),
         outcomeId: String(s.outcomeId),
         ...(s.specifier ? { specifier: s.specifier } : {}),
-        sportId: SPORTYBET_CONFIG.sportIdFootball,
+        sportId: s.sportId || SPORTYBET_CONFIG.sportIdFootball,
       })),
     };
 
@@ -522,7 +566,11 @@ export class SportyBetClient {
     }
 
     const shareCode = json.data.shareCode;
-    const verified = await this.verifyBookingCode(shareCode).catch(() => null);
+    let verified = await this.verifyBookingCode(shareCode).catch(() => null);
+    if (!verified) {
+      await new Promise((r) => setTimeout(r, 300));
+      verified = await this.verifyBookingCode(shareCode).catch(() => null);
+    }
     this.lastSuccessTimestamps.set('booking', new Date().toISOString());
 
     const combinedOdds = Number(
@@ -565,6 +613,8 @@ export class SportyBetClient {
           matchStatus?: string;
           status?: number;
           sport?: {
+            id?: string;
+            name?: string;
             category?: {
               name?: string;
               tournament?: { name?: string };
@@ -590,14 +640,20 @@ export class SportyBetClient {
       const o = m?.outcomes?.[0];
       if (!ev.eventId || !m || !o) continue;
       const oddsNum = Number(o.odds || 0);
+      const evSportId = String(ev.sport?.id || SPORTYBET_CONFIG.sportIdFootball);
+      const evSportName = String(
+        ev.sport?.name || SPORTYBET_SPORT_NAMES[evSportId] || 'Football'
+      );
       mappedSelections.push({
         bookmakerId: 'SPORTYBET_TZ',
         bookmakerName: 'SportyBet Tanzania',
+        sportId: evSportId,
+        sportName: evSportName,
         selectionKey: `${ev.eventId}::${m.id}::${m.specifier || ''}::${o.id}`,
         eventId: String(ev.eventId),
         homeTeam: String(ev.homeTeamName || 'Home'),
         awayTeam: String(ev.awayTeamName || 'Away'),
-        leagueName: String(ev.sport?.category?.tournament?.name || 'Football'),
+        leagueName: String(ev.sport?.category?.tournament?.name || evSportName),
         country: String(ev.sport?.category?.name || 'International'),
         estimateStartTime: Number(ev.estimateStartTime || 0),
         matchStatus: String(ev.matchStatus || 'Not start'),

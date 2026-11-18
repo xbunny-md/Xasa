@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   computeTeamSimilarity,
+  extractCleanBookingCode,
   findExactTargetMarketOutcome,
   matchFixtureToCandidates,
   normalizeTeamName,
@@ -129,6 +130,42 @@ describe('Cross-Bookmaker Fixture Matching & Squad Safety', () => {
     );
     expect(distant.bestMatch).toBeNull();
   });
+
+  it('flexibly matches abbreviated, partial, and differently formatted team names without dropping legs', () => {
+    expect(computeTeamSimilarity('Man Utd', 'Manchester United')).toBeGreaterThanOrEqual(0.8);
+    expect(computeTeamSimilarity('Paris SG', 'Paris Saint-Germain')).toBeGreaterThanOrEqual(0.8);
+    expect(computeTeamSimilarity('Brighton', 'Brighton & Hove Albion')).toBeGreaterThanOrEqual(0.75);
+    expect(computeTeamSimilarity('Bayern', 'FC Bayern Munich')).toBeGreaterThanOrEqual(0.8);
+    expect(computeTeamSimilarity('Sporting CP', 'Sporting Lisbon')).toBeGreaterThanOrEqual(0.8);
+    expect(computeTeamSimilarity('B. Dortmund', 'Borussia Dortmund')).toBeGreaterThanOrEqual(0.8);
+    expect(computeTeamSimilarity('W. Bremen', 'Werder Bremen')).toBeGreaterThanOrEqual(0.8);
+    expect(computeTeamSimilarity('Al-Ahly', 'Al Ahly Cairo')).toBeGreaterThanOrEqual(0.75);
+
+    const euroMatch = makeCandidateMatch({
+      eventId: 'bp_2002',
+      homeTeam: 'Manchester United',
+      awayTeam: 'Brighton & Hove Albion',
+      leagueName: 'English Premier League',
+    });
+
+    const fuzzyMatched = matchFixtureToCandidates(
+      {
+        homeTeam: 'Man Utd',
+        awayTeam: 'Brighton',
+        leagueName: 'Premier League',
+        estimateStartTime: Date.parse('2026-11-25T16:00:00.000Z'),
+      },
+      [euroMatch]
+    );
+    expect(fuzzyMatched.bestMatch?.eventId).toBe('bp_2002');
+    expect(fuzzyMatched.confidence).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('extracts clean booking codes from pasted SportyBet and betPawa share links', () => {
+    expect(extractCleanBookingCode('https://www.sportybet.com/tz/?shareCode=bc12ab')).toBe('BC12AB');
+    expect(extractCleanBookingCode('https://www.betpawa.co.tz/?bookingNumber=9k8m2p1')).toBe('9K8M2P1');
+    expect(extractCleanBookingCode('  ab12-cd  ')).toBe('AB12-CD');
+  });
 });
 
 describe('Canonical Market & Strict Outcome Mapping', () => {
@@ -215,6 +252,40 @@ describe('Canonical Market & Strict Outcome Mapping', () => {
       awayTeam: 'Young Africans',
     });
     expect(corners).toBeNull();
+
+    // Compound specifier extracts total=0.5 rather than leading from=1
+    const compoundHT = resolveCanonicalSelection({
+      bookmakerId: 'SPORTYBET_TZ',
+      marketId: '68',
+      marketName: '1st Half - Over/Under',
+      specifier: 'from=1&to=45|total=0.5',
+      outcomeDesc: 'Over 0.5',
+      homeTeam: 'Man Utd',
+      awayTeam: 'Brighton',
+    });
+    expect(compoundHT?.canonicalMarket).toBe('HT_OVER_UNDER');
+    expect(compoundHT?.line).toBe('0.5');
+
+    // Variant Double Chance and BTTS descriptions normalize cleanly
+    const dcSlash = resolveCanonicalSelection({
+      bookmakerId: 'BETPAWA_TZ',
+      marketId: '4693',
+      marketName: 'Double Chance',
+      outcomeDesc: '1/X',
+      homeTeam: 'Simba SC',
+      awayTeam: 'Young Africans',
+    });
+    expect(dcSlash?.canonicalOutcome).toBe('1X');
+
+    const bttsGG = resolveCanonicalSelection({
+      bookmakerId: 'BETPAWA_TZ',
+      marketId: '3795',
+      marketName: 'Both Teams To Score',
+      outcomeDesc: 'Yes (GG)',
+      homeTeam: 'Simba SC',
+      awayTeam: 'Young Africans',
+    });
+    expect(bttsGG?.canonicalOutcome).toBe('YES');
   });
 });
 

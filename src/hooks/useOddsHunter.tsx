@@ -3,13 +3,18 @@ import React, {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
+import { collection, doc, limit, onSnapshot, query, where } from 'firebase/firestore';
 import { useFirebase } from '../firebase/auth/AuthContext.tsx';
+import { db } from '../firebase/config.ts';
+import { handleFirestoreError, OperationType } from '../firebase/firestore/errors.ts';
 import {
   deleteFavoriteTicket,
   deletePublicTicketBundle,
+  mapPublicDocsToGeneratedTickets,
   saveAdminAuditLogRecord,
   saveAdminSettingsRecord,
   saveBookingCodeRecord,
@@ -20,6 +25,9 @@ import {
   syncPublicTicketBundle,
   updateUserPreferences,
   type AppNotificationRecord,
+  type PublicStatsDocRecord,
+  type PublicTicketDocRecord,
+  type PublicTicketUpdateDocRecord,
 } from '../firebase/firestore/repository.ts';
 import { apiClient } from '../services/apiClient.ts';
 import {
@@ -203,6 +211,9 @@ export const DEFAULT_FACTORY_CONFIG_UI: DailyFactoryConfig = {
   minIndividualOdds: 1.01,
   maxIndividualOdds: 1.25,
   dailyTicketTarget: 55,
+  liveFootballTarget: 12,
+  otherSportsTarget: 12,
+  autoReplenishOnSettle: true,
   maxTickets: 100,
   minSelections: 2,
   maxSelections: 15,
@@ -221,6 +232,66 @@ export const DEFAULT_FACTORY_CONFIG_UI: DailyFactoryConfig = {
   autoCreateBookingCodes: true,
   scheduleIntervalMinutes: 60,
 };
+
+function isTerminalStatus(status: GeneratedTicket['status']): boolean {
+  return status === 'WON' || status === 'LOST' || status === 'VOID';
+}
+
+function mergeImmutableFeeds(
+  firebaseTickets: GeneratedTicket[],
+  apiTickets: GeneratedTicket[]
+): GeneratedTicket[] {
+  const merged = new Map<string, GeneratedTicket>();
+
+  for (const fb of firebaseTickets) {
+    merged.set(fb.internalTicketId, fb);
+  }
+
+  for (const api of apiTickets) {
+    const existing = merged.get(api.internalTicketId);
+    if (!existing) {
+      merged.set(api.internalTicketId, api);
+      continue;
+    }
+
+    // Never mutate or overwrite immutable ticket core selections/category/odds or locked terminal outcomes
+    if (isTerminalStatus(existing.status)) {
+      continue;
+    }
+
+    const shouldTakeMutableUpdate =
+      isTerminalStatus(api.status) ||
+      (Boolean(api.shareCode) && !existing.shareCode) ||
+      api.status !== existing.status ||
+      api.selectionSettlements.length > existing.selectionSettlements.length;
+
+    if (shouldTakeMutableUpdate) {
+      merged.set(api.internalTicketId, {
+        ...existing,
+        status: api.status,
+        effectiveCombinedOdds: api.effectiveCombinedOdds,
+        shareCode: api.shareCode || existing.shareCode,
+        shareUrl: api.shareUrl || existing.shareUrl,
+        shareCodeVerified: api.shareCodeVerified || existing.shareCodeVerified,
+        bookingCodeStatus:
+          api.shareCode || existing.shareCode
+            ? 'GENERATED'
+            : api.bookingCodeStatus || existing.bookingCodeStatus,
+        bookingCodeError: api.bookingCodeError ?? existing.bookingCodeError,
+        selectionSettlements:
+          api.selectionSettlements.length > 0
+            ? api.selectionSettlements
+            : existing.selectionSettlements,
+        settledAt: api.settledAt || existing.settledAt,
+        lastCheckedAt: api.lastCheckedAt || existing.lastCheckedAt,
+      });
+    }
+  }
+
+  return Array.from(merged.values())
+    .filter((t) => isTicketAllowedInDailyFeed(t))
+    .sort((a, b) => Date.parse(b.generatedAt) - Date.parse(a.generatedAt));
+}
 
 interface OddsHunterContextValue {
   activeSection: NavSection;
@@ -434,13 +505,223 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
 
   const [notifications, setNotifications] = useState<LocalNotification[]>([]);
 
-  // Shared Daily Factory Feed & Analytics
-  const [portfolioTickets, setPortfolioTickets] = useState<GeneratedTicket[]>([]);
-  const [loadingPortfolio, setLoadingPortfolio] = useState(true);
-  const [analyticsSummary, setAnalyticsSummary] = useState<PerformanceAnalyticsSummary | null>(
+  // Shared Daily Factory Feed & Analytics (Firebase Immutable Base + Live Backend Sync)
+  const [firebaseTicketDocs, setFirebaseTicketDocs] = useState<PublicTicketDocRecord[]>([]);
+  const [firebaseUpdateDocs, setFirebaseUpdateDocs] = useState<PublicTicketUpdateDocRecord[]>([]);
+  const [firebasePublicStats, setFirebasePublicStats] = useState<PublicStatsDocRecord | null>(null);
+  const [firebaseFeedLoaded, setFirebaseFeedLoaded] = useState(false);
+  const [apiTickets, setApiTickets] = useState<GeneratedTicket[]>([]);
+  const [apiLoaded, setApiLoaded] = useState(false);
+  const [analyticsSummaryRaw, setAnalyticsSummary] = useState<PerformanceAnalyticsSummary | null>(
     null
   );
-  const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null);
+  const [schedulerStatusRaw, setSchedulerStatus] = useState<SchedulerStatus | null>(null);
+  const hydratedKeyRef = useRef<string>('');
+  const autoMirroredKeyRef = useRef<string>('');
+
+  const firebaseTickets = useMemo(
+    () => mapPublicDocsToGeneratedTickets(firebaseTicketDocs, firebaseUpdateDocs),
+    [firebaseTicketDocs, firebaseUpdateDocs]
+  );
+
+  const portfolioTickets = useMemo(
+    () => mergeImmutableFeeds(firebaseTickets, apiTickets),
+    [firebaseTickets, apiTickets]
+  );
+
+  const loadingPortfolio = !firebaseFeedLoaded && !apiLoaded;
+
+  const schedulerStatus = useMemo<SchedulerStatus | null>(() => {
+    if (!schedulerStatusRaw && !firebasePublicStats) return null;
+    const base = schedulerStatusRaw;
+    const fb = firebasePublicStats;
+    const todayKey = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Africa/Dar_es_Salaam',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+    const todayMerged = portfolioTickets.filter((t) => t.generatedDateKey === todayKey);
+
+    return {
+      enabled: base?.enabled ?? true,
+      paused: base?.paused ?? false,
+      factoryRunning: base?.factoryRunning ?? false,
+      resultsTrackerRunning: base?.resultsTrackerRunning ?? false,
+      resultsIntervalMinutes: base?.resultsIntervalMinutes ?? 10,
+      lastFactoryRunAt: base?.lastFactoryRunAt ?? (fb?.lastScanningAt || null),
+      lastResultsRunAt: base?.lastResultsRunAt ?? (fb?.lastSettlementAt || null),
+      lastScanningAt: base?.lastScanningAt ?? (fb?.lastScanningAt || null),
+      lastSettlementAt: base?.lastSettlementAt ?? (fb?.lastSettlementAt || null),
+      nextFactoryRunAt: base?.nextFactoryRunAt ?? null,
+      totalDailyTicketsToday: Math.max(
+        base?.totalDailyTicketsToday ?? 0,
+        fb?.totalGeneratedToday ?? 0,
+        todayMerged.length
+      ),
+      dailyTicketTarget: base?.dailyTicketTarget ?? fb?.dailyTicketTarget ?? 55,
+      liveFootballCount: Math.max(
+        base?.liveFootballCount ?? 0,
+        fb?.liveFootballCount ?? 0,
+        todayMerged.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length
+      ),
+      otherSportsCount: Math.max(
+        base?.otherSportsCount ?? 0,
+        fb?.otherSportsCount ?? 0,
+        todayMerged.filter((t) => t.feedSection === 'OTHER_SPORTS').length
+      ),
+      upcomingActiveCount: Math.max(
+        base?.upcomingActiveCount ?? 0,
+        fb?.upcomingActiveCount ?? 0,
+        todayMerged.filter(
+          (t) => (t.feedSection || 'UPCOMING') === 'UPCOMING' && !isTerminalStatus(t.status)
+        ).length
+      ),
+      settledWonCount: Math.max(
+        base?.settledWonCount ?? 0,
+        fb?.settledWonCount ?? 0,
+        portfolioTickets.filter((t) => t.status === 'WON').length
+      ),
+      settledLostCount: Math.max(
+        base?.settledLostCount ?? 0,
+        fb?.settledLostCount ?? 0,
+        portfolioTickets.filter((t) => t.status === 'LOST').length
+      ),
+      settledVoidCount: Math.max(
+        base?.settledVoidCount ?? 0,
+        fb?.settledVoidCount ?? 0,
+        portfolioTickets.filter((t) => t.status === 'VOID').length
+      ),
+      bookingCodesGeneratedToday: Math.max(
+        base?.bookingCodesGeneratedToday ?? 0,
+        fb?.bookingCodesGeneratedToday ?? 0,
+        todayMerged.filter((t) => Boolean(t.shareCode)).length
+      ),
+      bookingCodeFailuresToday: base?.bookingCodeFailuresToday ?? 0,
+      dailyShortfallReason: base?.dailyShortfallReason ?? null,
+    };
+  }, [schedulerStatusRaw, firebasePublicStats, portfolioTickets]);
+
+  const analyticsSummary = useMemo<PerformanceAnalyticsSummary | null>(() => {
+    if (
+      analyticsSummaryRaw &&
+      analyticsSummaryRaw.totalGenerated >= portfolioTickets.length
+    ) {
+      return analyticsSummaryRaw;
+    }
+    if (portfolioTickets.length === 0) {
+      return analyticsSummaryRaw;
+    }
+
+    const todayKey = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Africa/Dar_es_Salaam',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+
+    const wonCount = portfolioTickets.filter((t) => t.status === 'WON').length;
+    const lostCount = portfolioTickets.filter((t) => t.status === 'LOST').length;
+    const voidCount = portfolioTickets.filter((t) => t.status === 'VOID').length;
+    const partiallySettledCount = portfolioTickets.filter(
+      (t) => t.status === 'PARTIALLY_SETTLED'
+    ).length;
+    const pendingOrLiveCount = portfolioTickets.filter(
+      (t) => t.status === 'PENDING' || t.status === 'LIVE'
+    ).length;
+    const unverifiedCount = portfolioTickets.filter((t) => t.status === 'UNVERIFIED').length;
+    const settledNonVoid = wonCount + lostCount;
+
+    const buildRows = (
+      groups: Map<string, GeneratedTicket[]>
+    ): PerformanceAnalyticsSummary['byCategory'] =>
+      Array.from(groups.entries()).map(([label, list]) => {
+        const won = list.filter((x) => x.status === 'WON').length;
+        const lost = list.filter((x) => x.status === 'LOST').length;
+        const voided = list.filter((x) => x.status === 'VOID').length;
+        const pending = list.filter(
+          (x) => x.status === 'PENDING' || x.status === 'LIVE' || x.status === 'PARTIALLY_SETTLED'
+        ).length;
+        const denom = won + lost;
+        return {
+          label,
+          total: list.length,
+          won,
+          lost,
+          voided,
+          pending,
+          settledNonVoid: denom,
+          winRatePct: denom > 0 ? Number(((won / denom) * 100).toFixed(1)) : null,
+        };
+      });
+
+    const catMap = new Map<string, GeneratedTicket[]>();
+    const mktMap = new Map<string, GeneratedTicket[]>();
+    const lgMap = new Map<string, GeneratedTicket[]>();
+    const dayMap = new Map<string, GeneratedTicket[]>();
+
+    for (const t of portfolioTickets) {
+      const catList = catMap.get(t.categoryLabel) || [];
+      catList.push(t);
+      catMap.set(t.categoryLabel, catList);
+
+      const dayList = dayMap.get(t.generatedDateKey) || [];
+      dayList.push(t);
+      dayMap.set(t.generatedDateKey, dayList);
+
+      const seenMkts = new Set<string>();
+      const seenLeagues = new Set<string>();
+      for (const s of t.selections) {
+        if (s.marketName && !seenMkts.has(s.marketName)) {
+          seenMkts.add(s.marketName);
+          const arr = mktMap.get(s.marketName) || [];
+          arr.push(t);
+          mktMap.set(s.marketName, arr);
+        }
+        if (s.leagueName && !seenLeagues.has(s.leagueName)) {
+          seenLeagues.add(s.leagueName);
+          const arr = lgMap.get(s.leagueName) || [];
+          arr.push(t);
+          lgMap.set(s.leagueName, arr);
+        }
+      }
+    }
+
+    return {
+      totalGenerated: portfolioTickets.length,
+      generatedToday: portfolioTickets.filter((t) => t.generatedDateKey === todayKey).length,
+      dailyTarget: schedulerStatus?.dailyTicketTarget ?? analyticsSummaryRaw?.dailyTarget ?? 55,
+      totalSettled: wonCount + lostCount + voidCount,
+      wonCount,
+      lostCount,
+      voidCount,
+      partiallySettledCount,
+      pendingOrLiveCount,
+      unverifiedCount,
+      validSharingCodes: portfolioTickets.filter((t) => Boolean(t.shareCode)).length,
+      failedBookingCodes: portfolioTickets.filter((t) => !t.shareCode).length,
+      settledNonVoidDenominator: settledNonVoid,
+      winRatePct: settledNonVoid > 0 ? Number(((wonCount / settledNonVoid) * 100).toFixed(1)) : null,
+      lastScanningAt: schedulerStatus?.lastScanningAt ?? analyticsSummaryRaw?.lastScanningAt ?? null,
+      lastSettlementAt:
+        schedulerStatus?.lastSettlementAt ?? analyticsSummaryRaw?.lastSettlementAt ?? null,
+      byCategory: buildRows(catMap),
+      byMarket: buildRows(mktMap).slice(0, 15),
+      byLeague: buildRows(lgMap).slice(0, 15),
+      dailyTrends: Array.from(dayMap.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([dateKey, list]) => ({
+          dateKey,
+          generated: list.length,
+          won: list.filter((x) => x.status === 'WON').length,
+          lost: list.filter((x) => x.status === 'LOST').length,
+          voided: list.filter((x) => x.status === 'VOID').length,
+        })),
+      performanceDisclaimer:
+        analyticsSummaryRaw?.performanceDisclaimer ||
+        'Win rates are computed strictly from verified finished official SportyBet TZ / betPawa TZ match results stored in Firebase (voided tickets excluded from win-rate denominator).',
+    };
+  }, [analyticsSummaryRaw, portfolioTickets, schedulerStatus]);
 
   // Admin-Only State
   const [factoryConfig, setFactoryConfig] = useState<DailyFactoryConfig>(
@@ -676,14 +957,13 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
   }, [activeBookmaker, pushNotification]);
 
   const refreshPortfolio = useCallback(async () => {
-    setLoadingPortfolio(true);
     try {
       const res = await apiClient.listTickets();
-      setPortfolioTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
+      setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
     } catch {
-      // Preserve last fetched feed on transient error
+      // Preserve Firebase snapshot feed on transient backend error
     } finally {
-      setLoadingPortfolio(false);
+      setApiLoaded(true);
     }
   }, []);
 
@@ -757,6 +1037,59 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     refreshAnalytics,
     refreshScheduler,
   ]);
+
+  // Real-Time Firestore Listeners for Immutable Public Daily Feeds & Stats
+  useEffect(() => {
+    const unsubTickets = onSnapshot(
+      query(collection(db, 'publicTickets'), where('isPublic', '==', true), limit(500)),
+      (snap) => {
+        setFirebaseTicketDocs(
+          snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<PublicTicketDocRecord, 'id'>) }))
+        );
+        setFirebaseFeedLoaded(true);
+      },
+      (err) => {
+        setFirebaseFeedLoaded(true);
+        handleFirestoreError(err, OperationType.LIST, 'publicTickets');
+      }
+    );
+
+    const unsubUpdates = onSnapshot(
+      query(collection(db, 'publicTicketUpdates'), where('isPublic', '==', true), limit(500)),
+      (snap) => {
+        setFirebaseUpdateDocs(
+          snap.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as Omit<PublicTicketUpdateDocRecord, 'id'>),
+          }))
+        );
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'publicTicketUpdates');
+      }
+    );
+
+    const unsubStats = onSnapshot(
+      doc(db, 'publicStats', 'daily'),
+      (snap) => {
+        if (snap.exists()) {
+          setFirebasePublicStats({
+            id: snap.id,
+            ...(snap.data() as Omit<PublicStatsDocRecord, 'id'>),
+          });
+        }
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.GET, 'publicStats/daily');
+      }
+    );
+
+    return () => {
+      unsubTickets();
+      unsubUpdates();
+      unsubStats();
+    };
+  }, []);
 
   useEffect(() => {
     if (isAdmin) {
@@ -1020,21 +1353,139 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
   }, [getIdToken, isAdmin]);
 
   const syncPublicMirrorIfAdmin = useCallback(
-    async (ticketsToSync: GeneratedTicket[], status: SchedulerStatus) => {
+    async (ticketsToSync: GeneratedTicket[] = [], status?: SchedulerStatus | null) => {
       if (!user || !user.emailVerified || !isAdmin) return;
-      for (const t of ticketsToSync.slice(0, 60)) {
-        void syncPublicTicketBundle(user.uid, t).catch(() => {});
+      const list = Array.isArray(ticketsToSync) ? ticketsToSync : [];
+      for (let i = 0; i < Math.min(list.length, 200); i += 10) {
+        const chunk = list.slice(i, i + 10);
+        await Promise.all(
+          chunk.map((t) => syncPublicTicketBundle(user.uid, t).catch(() => {}))
+        );
       }
+
+      const todayKey = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Africa/Dar_es_Salaam',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(new Date());
+      const combined = mergeImmutableFeeds(firebaseTickets, list.length > 0 ? list : apiTickets);
+      const todayCombined = combined.filter((t) => t.generatedDateKey === todayKey);
+
       void savePublicStatsRecord({
-        dailyTicketTarget: status.dailyTicketTarget,
-        totalGeneratedToday: status.totalDailyTicketsToday,
-        bookingCodesGeneratedToday: status.bookingCodesGeneratedToday,
-        lastScanningAt: status.lastScanningAt,
-        lastSettlementAt: status.lastSettlementAt,
+        dailyTicketTarget: status?.dailyTicketTarget ?? factoryConfig.dailyTicketTarget,
+        totalGeneratedToday: Math.max(status?.totalDailyTicketsToday ?? 0, todayCombined.length),
+        bookingCodesGeneratedToday: Math.max(
+          status?.bookingCodesGeneratedToday ?? 0,
+          todayCombined.filter((t) => Boolean(t.shareCode)).length
+        ),
+        liveFootballCount: Math.max(
+          status?.liveFootballCount ?? 0,
+          todayCombined.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length
+        ),
+        otherSportsCount: Math.max(
+          status?.otherSportsCount ?? 0,
+          todayCombined.filter((t) => t.feedSection === 'OTHER_SPORTS').length
+        ),
+        upcomingActiveCount: Math.max(
+          status?.upcomingActiveCount ?? 0,
+          todayCombined.filter(
+            (t) => (t.feedSection || 'UPCOMING') === 'UPCOMING' && !isTerminalStatus(t.status)
+          ).length
+        ),
+        settledWonCount: Math.max(
+          status?.settledWonCount ?? 0,
+          combined.filter((t) => t.status === 'WON').length
+        ),
+        settledLostCount: Math.max(
+          status?.settledLostCount ?? 0,
+          combined.filter((t) => t.status === 'LOST').length
+        ),
+        settledVoidCount: Math.max(
+          status?.settledVoidCount ?? 0,
+          combined.filter((t) => t.status === 'VOID').length
+        ),
+        lastScanningAt: status?.lastScanningAt ?? schedulerStatus?.lastScanningAt ?? null,
+        lastSettlementAt: status?.lastSettlementAt ?? schedulerStatus?.lastSettlementAt ?? null,
       }).catch(() => {});
     },
-    [isAdmin, user]
+    [
+      apiTickets,
+      factoryConfig.dailyTicketTarget,
+      firebaseTickets,
+      isAdmin,
+      schedulerStatus?.lastScanningAt,
+      schedulerStatus?.lastSettlementAt,
+      user,
+    ]
   );
+
+  // Admin Cold-Start Hydration (Firebase -> Backend Memory) & Background Auto-Mirror (Backend -> Firebase)
+  useEffect(() => {
+    if (!isAdmin || !user?.emailVerified || !firebaseFeedLoaded || !apiLoaded) return;
+
+    const apiById = new Map(apiTickets.map((t) => [t.internalTicketId, t]));
+    const fbById = new Map(firebaseTickets.map((t) => [t.internalTicketId, t]));
+
+    const missingInBackend = firebaseTickets.filter((fb) => {
+      const apiMatch = apiById.get(fb.internalTicketId);
+      if (!apiMatch) return true;
+      return isTerminalStatus(fb.status) && !isTerminalStatus(apiMatch.status);
+    });
+
+    if (missingInBackend.length > 0) {
+      const hydrationSig = missingInBackend.map((t) => `${t.internalTicketId}:${t.status}`).join('|');
+      if (hydratedKeyRef.current !== hydrationSig) {
+        hydratedKeyRef.current = hydrationSig;
+        void getIdToken().then((token) => {
+          if (!token) return;
+          void apiClient
+            .hydrateTickets(firebaseTickets.slice(0, 200), token)
+            .then(() => {
+              void refreshPortfolio();
+              void refreshScheduler();
+              void refreshAnalytics();
+            })
+            .catch(() => {});
+        });
+      }
+    }
+
+    const unsyncedToFirebase = apiTickets.filter((api) => {
+      const fb = fbById.get(api.internalTicketId);
+      if (!fb) return true;
+      if (isTerminalStatus(fb.status)) return false;
+      return (
+        isTerminalStatus(api.status) ||
+        api.status !== fb.status ||
+        (Boolean(api.shareCode) && !fb.shareCode)
+      );
+    });
+
+    if (unsyncedToFirebase.length > 0) {
+      const mirrorSig = unsyncedToFirebase
+        .slice(0, 40)
+        .map((t) => `${t.internalTicketId}:${t.status}:${t.shareCode || ''}`)
+        .join('|');
+      if (autoMirroredKeyRef.current !== mirrorSig) {
+        autoMirroredKeyRef.current = mirrorSig;
+        void syncPublicMirrorIfAdmin(unsyncedToFirebase, schedulerStatusRaw);
+      }
+    }
+  }, [
+    apiLoaded,
+    apiTickets,
+    firebaseFeedLoaded,
+    firebaseTickets,
+    getIdToken,
+    isAdmin,
+    refreshAnalytics,
+    refreshPortfolio,
+    refreshScheduler,
+    schedulerStatusRaw,
+    syncPublicMirrorIfAdmin,
+    user?.emailVerified,
+  ]);
 
   const saveFactoryConfig = useCallback(
     async (cfg: DailyFactoryConfig) => {
@@ -1054,7 +1505,9 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         'Daily Factory Settings Updated',
         `Saved ${res.config.minIndividualOdds.toFixed(2)}–${res.config.maxIndividualOdds.toFixed(
           2
-        )} individual odds, ${res.config.dailyTicketTarget} daily target.`
+        )} individual odds, ${res.config.dailyTicketTarget} upcoming target, ${
+          res.config.liveFootballTarget ?? 12
+        } live football, ${res.config.otherSportsTarget ?? 12} other games.`
       );
     },
     [isAdmin, pushNotification, requireAdminToken, user]
@@ -1087,11 +1540,13 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     try {
       const token = await requireAdminToken();
       const res = await apiClient.runDailyFactoryNow(token);
-      setPortfolioTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
+      setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
       setSchedulerStatus(res.status);
       setAutomationLogs(res.logs);
       await refreshAnalytics();
-      void syncPublicMirrorIfAdmin(res.newTickets, res.status);
+      const toMirror =
+        Array.isArray(res.newTickets) && res.newTickets.length > 0 ? res.newTickets : res.tickets;
+      void syncPublicMirrorIfAdmin(toMirror, res.status);
       if (user && user.emailVerified && isAdmin) {
         void saveAdminAuditLogRecord(user, res.log).catch(() => {});
       }
@@ -1108,7 +1563,9 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     async (internalTicketId: string) => {
       const token = await requireAdminToken();
       await apiClient.deleteTicket(internalTicketId, token);
-      setPortfolioTickets((prev) => prev.filter((t) => t.internalTicketId !== internalTicketId));
+      setApiTickets((prev) => prev.filter((t) => t.internalTicketId !== internalTicketId));
+      setFirebaseTicketDocs((prev) => prev.filter((t) => t.internalTicketId !== internalTicketId));
+      setFirebaseUpdateDocs((prev) => prev.filter((t) => t.internalTicketId !== internalTicketId));
       if (selectedTicketId === internalTicketId) {
         setSelectedTicketId(null);
         setActiveSection('feed');
@@ -1128,7 +1585,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         const token = await requireAdminToken();
         const res = await apiClient.createTicketBookingCode(internalTicketId, token);
         if (res.ticket) {
-          setPortfolioTickets((prev) =>
+          setApiTickets((prev) =>
             prev.map((t) => (t.internalTicketId === internalTicketId ? res.ticket : t))
           );
           await refreshAnalytics();
@@ -1160,7 +1617,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       try {
         const token = await requireAdminToken();
         const res = await apiClient.retryFailedBookingCodes(token, ticketIds);
-        setPortfolioTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
+        setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
         setSchedulerStatus(res.status);
         setAutomationLogs(res.logs);
         await refreshAnalytics();
@@ -1185,11 +1642,15 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       try {
         const token = await requireAdminToken();
         const res = await apiClient.trackTicketsResults(token, ticketIds);
-        setPortfolioTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
+        setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
         setSchedulerStatus(res.status);
         setAutomationLogs(res.logs);
         await refreshAnalytics();
-        void syncPublicMirrorIfAdmin(res.updatedTickets, res.status);
+        const mirrorBatch = [
+          ...(Array.isArray(res.updatedTickets) ? res.updatedTickets : []),
+          ...(Array.isArray(res.replenishedTickets) ? res.replenishedTickets : []),
+        ];
+        void syncPublicMirrorIfAdmin(mirrorBatch, res.status);
         if (user && user.emailVerified && isAdmin) {
           void saveAdminAuditLogRecord(user, res.log).catch(() => {});
         }
@@ -1317,6 +1778,8 @@ export function selectionFromQualifying(q: QualifyingSelection): Omit<BetslipSel
     selectionKey: q.selectionKey,
     bookmakerId: q.bookmakerId,
     bookmakerName: q.bookmakerName,
+    sportId: q.sportId,
+    sportName: q.sportName,
     eventId: q.eventId,
     homeTeam: q.homeTeam,
     awayTeam: q.awayTeam,

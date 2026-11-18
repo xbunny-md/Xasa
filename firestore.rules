@@ -269,6 +269,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'isPublic', 'publishedByUid', 'internalTicketId', 'signature', 'bookmakerId',
+          'feedSection', 'sportId', 'sportName', 'replacedTicketId',
           'sourceType', 'categoryId', 'categoryLabel', 'targetOdds', 'actualCombinedOdds',
           'selectionCount', 'kickoffStartMs', 'kickoffEndMs', 'dataSource',
           'generatedDateKey', 'originalSelections', 'createdAt'
@@ -279,6 +280,10 @@ service cloud.firestore {
         && isValidId(data.internalTicketId) && data.internalTicketId.size() >= 3 && data.internalTicketId.size() <= 64
         && isValidString(data.signature, 4, 160)
         && (!data.keys().hasAny(['bookmakerId']) || data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ'])
+        && (!data.keys().hasAny(['feedSection']) || data.feedSection in ['UPCOMING', 'LIVE_FOOTBALL', 'OTHER_SPORTS'])
+        && (!data.keys().hasAny(['sportId']) || isValidString(data.sportId, 1, 40))
+        && (!data.keys().hasAny(['sportName']) || isValidString(data.sportName, 1, 60))
+        && (!data.keys().hasAny(['replacedTicketId']) || isValidString(data.replacedTicketId, 0, 64))
         && data.sourceType in ['DAILY_FACTORY', 'ADMIN_MANUAL']
         && isValidString(data.categoryId, 1, 40)
         && isValidString(data.categoryLabel, 1, 60)
@@ -330,7 +335,9 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'updatedByUid', 'updatedByEmail', 'enabled', 'paused', 'activeBookmaker',
-          'minIndividualOdds', 'maxIndividualOdds', 'dailyTicketTarget', 'maxTickets', 'minSelections',
+          'minIndividualOdds', 'maxIndividualOdds', 'dailyTicketTarget',
+          'liveFootballTarget', 'otherSportsTarget', 'autoReplenishOnSettle',
+          'maxTickets', 'minSelections',
           'maxSelections', 'anyMarket', 'markets', 'windowStartTime', 'windowEndTime',
           'timezone', 'scheduleIntervalMinutes', 'createdAt', 'updatedAt'
         ])
@@ -343,6 +350,9 @@ service cloud.firestore {
         && data.minIndividualOdds is number && data.minIndividualOdds >= 1.01 && data.minIndividualOdds <= 100
         && data.maxIndividualOdds is number && data.maxIndividualOdds >= data.minIndividualOdds && data.maxIndividualOdds <= 1000
         && data.dailyTicketTarget is number && data.dailyTicketTarget >= 1 && data.dailyTicketTarget <= 200
+        && (!data.keys().hasAny(['liveFootballTarget']) || (data.liveFootballTarget is number && data.liveFootballTarget >= 10 && data.liveFootballTarget <= 100))
+        && (!data.keys().hasAny(['otherSportsTarget']) || (data.otherSportsTarget is number && data.otherSportsTarget >= 10 && data.otherSportsTarget <= 100))
+        && (!data.keys().hasAny(['autoReplenishOnSettle']) || data.autoReplenishOnSettle is bool)
         && data.maxTickets is number && data.maxTickets >= 1 && data.maxTickets <= 200
         && data.minSelections is number && data.minSelections >= 1 && data.minSelections <= 25
         && data.maxSelections is number && data.maxSelections >= data.minSelections && data.maxSelections <= 25
@@ -363,12 +373,20 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'isPublic', 'dailyTicketTarget', 'totalGeneratedToday', 'bookingCodesGeneratedToday',
+          'liveFootballCount', 'otherSportsCount', 'upcomingActiveCount',
+          'settledWonCount', 'settledLostCount', 'settledVoidCount',
           'lastScanningAt', 'lastSettlementAt', 'updatedAt'
         ])
         && data.isPublic == true
         && data.dailyTicketTarget is number && data.dailyTicketTarget >= 1 && data.dailyTicketTarget <= 200
-        && data.totalGeneratedToday is number && data.totalGeneratedToday >= 0 && data.totalGeneratedToday <= 500
-        && data.bookingCodesGeneratedToday is number && data.bookingCodesGeneratedToday >= 0 && data.bookingCodesGeneratedToday <= 500
+        && data.totalGeneratedToday is number && data.totalGeneratedToday >= 0 && data.totalGeneratedToday <= 1000
+        && data.bookingCodesGeneratedToday is number && data.bookingCodesGeneratedToday >= 0 && data.bookingCodesGeneratedToday <= 1000
+        && (!data.keys().hasAny(['liveFootballCount']) || (data.liveFootballCount is number && data.liveFootballCount >= 0 && data.liveFootballCount <= 500))
+        && (!data.keys().hasAny(['otherSportsCount']) || (data.otherSportsCount is number && data.otherSportsCount >= 0 && data.otherSportsCount <= 500))
+        && (!data.keys().hasAny(['upcomingActiveCount']) || (data.upcomingActiveCount is number && data.upcomingActiveCount >= 0 && data.upcomingActiveCount <= 500))
+        && (!data.keys().hasAny(['settledWonCount']) || (data.settledWonCount is number && data.settledWonCount >= 0 && data.settledWonCount <= 5000))
+        && (!data.keys().hasAny(['settledLostCount']) || (data.settledLostCount is number && data.settledLostCount >= 0 && data.settledLostCount <= 5000))
+        && (!data.keys().hasAny(['settledVoidCount']) || (data.settledVoidCount is number && data.settledVoidCount >= 0 && data.settledVoidCount <= 5000))
         && isValidString(data.lastScanningAt, 0, 40)
         && isValidString(data.lastSettlementAt, 0, 40)
         && data.updatedAt is timestamp;
@@ -470,6 +488,7 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly([
           'updatedByUid', 'updatedByEmail', 'enabled', 'paused', 'activeBookmaker',
           'minIndividualOdds', 'maxIndividualOdds', 'dailyTicketTarget',
+          'liveFootballTarget', 'otherSportsTarget', 'autoReplenishOnSettle',
           'maxTickets', 'minSelections', 'maxSelections', 'anyMarket',
           'markets', 'windowStartTime', 'windowEndTime', 'timezone',
           'scheduleIntervalMinutes', 'updatedAt'

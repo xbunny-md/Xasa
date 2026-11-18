@@ -1,12 +1,22 @@
 import { useMemo, useState } from 'react';
-import { AlertCircle, RefreshCw, Search, ShieldCheck, Ticket } from 'lucide-react';
+import {
+  AlertCircle,
+  Database,
+  Flame,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Ticket,
+  Trophy,
+} from 'lucide-react';
 import { useOddsHunter } from '../hooks/useOddsHunter.tsx';
 import { TicketPosterCard } from '../components/TicketPosterCard.tsx';
 import { isTicketAllowedInDailyFeed } from '../utils/dailyFeedFilter.ts';
 import { formatDateTimeCompact } from '../utils/formatters.ts';
-import type { BookmakerId } from '../types/sportybet.ts';
+import type { BookmakerId, FeedSection } from '../types/sportybet.ts';
 
 type FeedStatusFilter = 'ALL' | 'TODAY' | 'UPCOMING' | 'PENDING' | 'WON' | 'LOST' | 'VOID';
+type FeedSectionFilter = 'ALL' | FeedSection;
 type SortOption = 'newest' | 'odds_asc' | 'odds_desc' | 'kickoff_asc';
 
 function getTodayKeyTz(): string {
@@ -34,6 +44,7 @@ export function TicketFeedPage() {
     toggleFavoriteTicket,
   } = useOddsHunter();
 
+  const [sectionFilter, setSectionFilter] = useState<FeedSectionFilter>('ALL');
   const [statusFilter, setStatusFilter] = useState<FeedStatusFilter>('ALL');
   const [categoryFilter, setCategoryFilter] = useState<string>('ALL');
   const [bookmakerFilter, setBookmakerFilter] = useState<'ALL' | BookmakerId>('ALL');
@@ -46,6 +57,46 @@ export function TicketFeedPage() {
     () => portfolioTickets.filter((t) => isTicketAllowedInDailyFeed(t)),
     [portfolioTickets]
   );
+
+  const feedCounts = useMemo(() => {
+    const now = Date.now();
+    let upcomingSec = 0;
+    let liveFootballSec = 0;
+    let otherSportsSec = 0;
+    let today = 0;
+    let upcomingKickoff = 0;
+    let pending = 0;
+    let won = 0;
+    let lost = 0;
+    let voided = 0;
+
+    for (const t of allowedTickets) {
+      const sec = t.feedSection || 'UPCOMING';
+      if (sec === 'LIVE_FOOTBALL') liveFootballSec++;
+      else if (sec === 'OTHER_SPORTS') otherSportsSec++;
+      else upcomingSec++;
+
+      if (t.generatedDateKey === todayKey) today++;
+      if (t.kickoffStartMs > now && t.status === 'PENDING') upcomingKickoff++;
+      if (t.status === 'PENDING' || t.status === 'LIVE') pending++;
+      if (t.status === 'WON') won++;
+      if (t.status === 'LOST') lost++;
+      if (t.status === 'VOID') voided++;
+    }
+
+    return {
+      total: allowedTickets.length,
+      upcomingSec,
+      liveFootballSec,
+      otherSportsSec,
+      today,
+      upcomingKickoff,
+      pending,
+      won,
+      lost,
+      voided,
+    };
+  }, [allowedTickets, todayKey]);
 
   const categoryOptions = useMemo(() => {
     const map = new Map<string, string>();
@@ -62,6 +113,9 @@ export function TicketFeedPage() {
     const q = searchQuery.trim().toLowerCase();
 
     const list = allowedTickets.filter((t) => {
+      const sec: FeedSection = t.feedSection || 'UPCOMING';
+      if (sectionFilter !== 'ALL' && sec !== sectionFilter) return false;
+
       if (statusFilter === 'TODAY' && t.generatedDateKey !== todayKey) return false;
       if (statusFilter === 'UPCOMING' && !(t.kickoffStartMs > now && t.status === 'PENDING')) {
         return false;
@@ -82,13 +136,15 @@ export function TicketFeedPage() {
         const matchesId = t.internalTicketId.toLowerCase().includes(q);
         const matchesCode = (t.shareCode || '').toLowerCase().includes(q);
         const matchesCategory = t.categoryLabel.toLowerCase().includes(q);
+        const matchesSport = (t.sportName || '').toLowerCase().includes(q);
         const matchesTeam = t.selections.some(
           (s) =>
             s.homeTeam.toLowerCase().includes(q) ||
             s.awayTeam.toLowerCase().includes(q) ||
-            s.leagueName.toLowerCase().includes(q)
+            s.leagueName.toLowerCase().includes(q) ||
+            (s.sportName || '').toLowerCase().includes(q)
         );
-        if (!matchesId && !matchesCode && !matchesCategory && !matchesTeam) {
+        if (!matchesId && !matchesCode && !matchesCategory && !matchesSport && !matchesTeam) {
           return false;
         }
       }
@@ -102,36 +158,56 @@ export function TicketFeedPage() {
       if (sortBy === 'kickoff_asc') return a.kickoffStartMs - b.kickoffStartMs;
       return new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime();
     });
-  }, [allowedTickets, statusFilter, categoryFilter, bookmakerFilter, searchQuery, sortBy, todayKey]);
+  }, [
+    allowedTickets,
+    sectionFilter,
+    statusFilter,
+    categoryFilter,
+    bookmakerFilter,
+    searchQuery,
+    sortBy,
+    todayKey,
+  ]);
 
-  const todayCount = schedulerStatus?.totalDailyTicketsToday ?? analyticsSummary?.generatedToday ?? 0;
+  const todayCount =
+    schedulerStatus?.totalDailyTicketsToday ?? analyticsSummary?.generatedToday ?? feedCounts.today;
   const dailyTarget = schedulerStatus?.dailyTicketTarget ?? analyticsSummary?.dailyTarget ?? 55;
   const bookingCodesCount =
-    schedulerStatus?.bookingCodesGeneratedToday ?? analyticsSummary?.validSharingCodes ?? 0;
+    schedulerStatus?.bookingCodesGeneratedToday ??
+    analyticsSummary?.validSharingCodes ??
+    allowedTickets.filter((t) => Boolean(t.shareCode)).length;
+  const wonCount = Math.max(schedulerStatus?.settledWonCount ?? 0, feedCounts.won);
+  const lostCount = Math.max(schedulerStatus?.settledLostCount ?? 0, feedCounts.lost);
+  const voidCount = Math.max(schedulerStatus?.settledVoidCount ?? 0, feedCounts.voided);
 
   return (
     <div className="space-y-6">
       {/* Compact Hero Summary Strip */}
       <section className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] p-4 sm:p-5 shadow-xs dark:shadow-none">
-        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+        <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-4">
           <div className="space-y-1">
-            <div className="flex items-center gap-2 text-xs font-medium text-blue-700 dark:text-blue-300">
+            <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-blue-700 dark:text-blue-300">
               <ShieldCheck className="w-4 h-4 shrink-0" />
-              <span>Tanzania Verified Daily Feed · Strict 1.01–1.25 Selection Filter</span>
+              <span>Immutable Firebase Daily Feed · Strict 1.01–1.25 Filter</span>
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 font-mono text-[10px]">
+                <Database className="w-3 h-3" />
+                Firebase Synced
+              </span>
             </div>
             <h2 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
               Daily Automated Odds Tickets
             </h2>
             <p className="text-xs text-slate-600 dark:text-slate-400">
-              Real upcoming fixtures published across multi-tier odds categories with verified
-              booking codes and live settlement tracking.
+              Tickets stay permanently stored in Firebase with locked WON / LOST / VOID outcomes.
+              When an upcoming code finishes, a fresh upcoming replacement code is automatically generated
+              alongside 10+ Live Football and 10+ Other Games cards.
             </p>
           </div>
 
-          <div className="grid grid-cols-3 gap-2 sm:gap-3 shrink-0">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 shrink-0">
             <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
               <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Today&apos;s Tickets
+                Today&apos;s Feed
               </span>
               <span className="font-mono text-lg font-bold text-slate-900 dark:text-white tabular-nums">
                 {todayCount}
@@ -140,20 +216,36 @@ export function TicketFeedPage() {
             </div>
             <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
               <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Booking Codes
+                Live FB · Other
               </span>
-              <span className="font-mono text-lg font-bold text-emerald-700 dark:text-emerald-300 tabular-nums">
-                {bookingCodesCount}
+              <span className="font-mono text-lg font-bold text-amber-700 dark:text-amber-300 tabular-nums">
+                {feedCounts.liveFootballSec}
+                <span className="text-xs font-normal text-slate-500"> · {feedCounts.otherSportsSec}</span>
               </span>
             </div>
             <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
               <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Last Scan
+                Won / Lost / Void
               </span>
-              <span className="font-mono text-xs font-medium text-slate-700 dark:text-slate-300 block mt-1 truncate">
+              <span className="font-mono text-sm font-bold tabular-nums block mt-1">
+                <span className="text-emerald-700 dark:text-emerald-300">{wonCount}W</span>
+                <span className="text-slate-400"> · </span>
+                <span className="text-rose-700 dark:text-rose-300">{lostCount}L</span>
+                <span className="text-slate-400"> · </span>
+                <span className="text-slate-600 dark:text-slate-300">{voidCount}V</span>
+              </span>
+            </div>
+            <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
+              <span className="block text-[10px] uppercase tracking-wider text-slate-500">
+                Codes · Scan
+              </span>
+              <span className="font-mono text-sm font-bold text-emerald-700 dark:text-emerald-300 tabular-nums">
+                {bookingCodesCount} codes
+              </span>
+              <span className="font-mono text-[10px] text-slate-500 block truncate">
                 {schedulerStatus?.lastScanningAt
                   ? formatDateTimeCompact(schedulerStatus.lastScanningAt)
-                  : 'Running...'}
+                  : 'Ready'}
               </span>
             </div>
           </div>
@@ -167,19 +259,51 @@ export function TicketFeedPage() {
         )}
       </section>
 
-      {/* Filter Tabs & Controls */}
+      {/* Feed Section Selector (Upcoming Football, 10+ Live Football, 10+ Other Games) */}
       <section className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+            {(
+              [
+                { id: 'ALL', label: `All Feed (${feedCounts.total})`, icon: Ticket },
+                { id: 'UPCOMING', label: `Upcoming Football (${feedCounts.upcomingSec})`, icon: ShieldCheck },
+                { id: 'LIVE_FOOTBALL', label: `Live Football 10+ (${feedCounts.liveFootballSec})`, icon: Flame },
+                { id: 'OTHER_SPORTS', label: `Other Games 10+ (${feedCounts.otherSportsSec})`, icon: Trophy },
+              ] as const
+            ).map((sec) => {
+              const Icon = sec.icon;
+              const active = sectionFilter === sec.id;
+              return (
+                <button
+                  key={sec.id}
+                  type="button"
+                  onClick={() => setSectionFilter(sec.id)}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors border ${
+                    active
+                      ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white'
+                      : 'bg-white text-slate-700 hover:text-slate-900 border-slate-200 dark:bg-[#111827] dark:text-slate-300 dark:hover:text-white dark:border-white/[0.08]'
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  <span>{sec.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Status Filter Tabs & Refresh */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
             {(
               [
-                { id: 'ALL', label: 'All Tickets' },
-                { id: 'TODAY', label: "Today's Tickets" },
-                { id: 'UPCOMING', label: 'Upcoming' },
-                { id: 'PENDING', label: 'Pending' },
-                { id: 'WON', label: 'Won' },
-                { id: 'LOST', label: 'Lost' },
-                { id: 'VOID', label: 'Void' },
+                { id: 'ALL', label: `All (${feedCounts.total})` },
+                { id: 'TODAY', label: `Today (${feedCounts.today})` },
+                { id: 'UPCOMING', label: `Upcoming (${feedCounts.upcomingKickoff})` },
+                { id: 'PENDING', label: `Pending (${feedCounts.pending})` },
+                { id: 'WON', label: `Won (${feedCounts.won})` },
+                { id: 'LOST', label: `Lost (${feedCounts.lost})` },
+                { id: 'VOID', label: `Void (${feedCounts.voided})` },
               ] as const
             ).map((tab) => {
               const active = statusFilter === tab.id;
@@ -217,7 +341,7 @@ export function TicketFeedPage() {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search Ticket ID, booking code, team, league..."
+              placeholder="Search code, team, sport, league..."
               className="w-full pl-9 pr-3 py-2 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500/40"
             />
           </label>
@@ -279,8 +403,8 @@ export function TicketFeedPage() {
           </p>
           <p className="text-xs text-slate-500 dark:text-slate-400">
             {portfolioTickets.length === 0
-              ? 'The Daily Factory checks live Tanzania bookmaker fixtures automatically and publishes eligible tickets here.'
-              : 'Clear search terms or select All Tickets to view the full daily feed.'}
+              ? 'The Daily Factory checks live Tanzania bookmaker fixtures automatically and persists eligible tickets to Firebase.'
+              : 'Clear search terms or select All Feed / All Tickets to view stored daily cards.'}
           </p>
         </div>
       ) : (

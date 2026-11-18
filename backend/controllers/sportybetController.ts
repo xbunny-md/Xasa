@@ -23,6 +23,7 @@ import {
   authAuditSchema,
   betslipPayloadSchema,
   dailyFactoryConfigSchema,
+  hydrateTicketsSchema,
   platformSettingsSchema,
   scannerConfigSchema,
   transferConfirmSchema,
@@ -42,7 +43,12 @@ import { platformConfigService } from '../services/platformConfigService.ts';
 import { runLiveOddsScan } from '../services/scannerService.ts';
 import { schedulerService } from '../services/schedulerService.ts';
 import { computePerformanceAnalytics } from '../services/settlementService.ts';
-import type { BackendLogEntry, BookmakerId, NormalizedMatch } from '../../src/types/sportybet.ts';
+import type {
+  BackendLogEntry,
+  BookmakerId,
+  GeneratedTicket,
+  NormalizedMatch,
+} from '../../src/types/sportybet.ts';
 import {
   DEFAULT_ALLOWED_DAILY_FEED_MARKETS,
   isTicketAllowedInDailyFeed,
@@ -609,9 +615,11 @@ export async function updateDailyFactoryConfig(req: AdminRequest, res: Response)
     ticketsSettled: 0,
     message: `Updated factory settings: odds ${saved.minIndividualOdds.toFixed(
       2
-    )}–${saved.maxIndividualOdds.toFixed(2)}, daily target ${saved.dailyTicketTarget}, ${
-      saved.oddsCategories.length
-    } categories, auto-booking ${saved.autoCreateBookingCodes ? 'ON' : 'OFF'}.`,
+    )}–${saved.maxIndividualOdds.toFixed(2)}, upcoming ${saved.dailyTicketTarget}, live football ${
+      saved.liveFootballTarget ?? 12
+    }, other games ${saved.otherSportsTarget ?? 12}, auto-booking ${
+      saved.autoCreateBookingCodes ? 'ON' : 'OFF'
+    }, auto-replenish ${saved.autoReplenishOnSettle !== false ? 'ON' : 'OFF'}.`,
   });
 
   res.json({
@@ -675,6 +683,7 @@ export async function runDailyFactoryNow(req: AdminRequest, res: Response) {
     const result = await schedulerService.runDailyFactoryJob(true, req.adminUser?.email || null);
     res.json({
       ...result,
+      newTickets: result.tickets,
       status: schedulerService.getStatus(),
       tickets: automationStore.getTickets(),
       logs: automationStore.getLogs().slice(0, 80),
@@ -802,6 +811,21 @@ export async function trackTicketsResults(req: AdminRequest, res: Response) {
   } catch (err) {
     handleError(res, err, 'TRACK_RESULTS_FAILED');
   }
+}
+
+export async function hydrateTicketsHandler(req: AdminRequest, res: Response) {
+  const parsed = hydrateTicketsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid Firebase ticket hydration payload.' });
+  }
+  const hydratedCount = automationStore.hydrateTickets(
+    parsed.data.tickets as unknown as GeneratedTicket[]
+  );
+  res.json({
+    hydratedCount,
+    totalTickets: automationStore.getTickets().length,
+    status: schedulerService.getStatus(),
+  });
 }
 
 export async function getAdminOverview(_req: AdminRequest, res: Response) {

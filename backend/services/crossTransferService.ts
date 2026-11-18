@@ -144,16 +144,146 @@ const TEAM_NOISE_WORDS = new Set([
   'de',
   'la',
   'the',
+  'sports',
+  'sport',
+  'football',
+  'futbol',
+  'futebol',
+  'soccer',
+  'calcio',
+  'ec',
+  'kv',
+  'rsc',
+  'krc',
+  'tsv',
+  'fsv',
+  'sg',
+  'spvgg',
+  'us',
+  'uc',
+  'ce',
+  'cp',
+  'ad',
+  'gd',
+  'rcd',
+  'ik',
+  'aik',
+  'ff',
+  'gif',
+  'ifk',
+  'pfc',
+  'ofk',
+  'hnk',
+  'gnk',
+  'bsc',
+  'hsc',
+  'asc',
+  'csc',
+  'ks',
+  'fk',
+  'mk',
+  'ac',
+  'se',
+  'esporte',
+  'clube',
 ]);
 
+const TEAM_TOKEN_EXPANSIONS: Record<string, string> = {
+  utd: 'united',
+  man: 'manchester',
+  sheff: 'sheffield',
+  nottm: 'nottingham',
+  nott: 'nottingham',
+  wolves: 'wolverhampton',
+  spurs: 'tottenham',
+  gladbach: 'monchengladbach',
+  moenchengladbach: 'monchengladbach',
+  munich: 'munchen',
+  cologne: 'koln',
+  kobenhavn: 'copenhagen',
+  st: 'saint',
+  atl: 'atletico',
+  athletico: 'atletico',
+  dep: 'deportivo',
+  olymp: 'olympique',
+  internazionale: 'inter',
+  inter: 'inter',
+  brom: 'bromwich',
+  alb: 'albion',
+  boro: 'middlesbrough',
+  el: 'al',
+};
+
+// Canonical alias equivalence map for common abbreviated vs full club names across bookmakers
+const TEAM_CANONICAL_ALIASES: Record<string, string> = {
+  psg: 'paris saint germain',
+  'paris sg': 'paris saint germain',
+  'paris saint germain': 'paris saint germain',
+  bvb: 'borussia dortmund',
+  'borussia dortmund': 'borussia dortmund',
+  dortmund: 'borussia dortmund',
+  qpr: 'queens park rangers',
+  'queens park rangers': 'queens park rangers',
+  yanga: 'young africans',
+  'young africans': 'young africans',
+  'sporting cp': 'sporting lisbon',
+  'sporting lisbon': 'sporting lisbon',
+  sporting: 'sporting lisbon',
+  'inter milan': 'inter milan',
+  inter: 'inter milan',
+  milan: 'ac milan',
+  'ac milan': 'ac milan',
+  'manchester utd': 'manchester united',
+  'manchester united': 'manchester united',
+  'manchester city': 'manchester city',
+  tottenham: 'tottenham hotspur',
+  'tottenham hotspur': 'tottenham hotspur',
+  wolverhampton: 'wolverhampton wanderers',
+  'wolverhampton wanderers': 'wolverhampton wanderers',
+  brighton: 'brighton and hove albion',
+  'brighton hove albion': 'brighton and hove albion',
+  'brighton and hove albion': 'brighton and hove albion',
+  'west ham': 'west ham united',
+  'west ham united': 'west ham united',
+  newcastle: 'newcastle united',
+  'newcastle united': 'newcastle united',
+  'west bromwich': 'west bromwich albion',
+  'west bromwich albion': 'west bromwich albion',
+  'bayern munchen': 'bayern munchen',
+  bayern: 'bayern munchen',
+  'bayer leverkusen': 'bayer leverkusen',
+  leverkusen: 'bayer leverkusen',
+  'rasenballsport leipzig': 'rb leipzig',
+  'rb leipzig': 'rb leipzig',
+  leipzig: 'rb leipzig',
+  atleti: 'atletico madrid',
+  'atletico madrid': 'atletico madrid',
+  om: 'olympique marseille',
+  marseille: 'olympique marseille',
+  'olympique marseille': 'olympique marseille',
+  ol: 'olympique lyon',
+  lyon: 'olympique lyon',
+  'olympique lyonnais': 'olympique lyon',
+  'olympique lyon': 'olympique lyon',
+  psv: 'psv eindhoven',
+  'psv eindhoven': 'psv eindhoven',
+  az: 'az alkmaar',
+  'az alkmaar': 'az alkmaar',
+  ajax: 'ajax amsterdam',
+  'ajax amsterdam': 'ajax amsterdam',
+  'crvena zvezda': 'red star belgrade',
+  'red star belgrade': 'red star belgrade',
+};
+
 const SQUAD_QUALIFIER_PATTERNS: Array<{ tag: string; regex: RegExp }> = [
-  { tag: 'WOMEN', regex: /\b(women|woman|ladies|fem|femenino|frauen|w)\b|\(w\)/i },
+  { tag: 'WOMEN', regex: /\b(women|woman|ladies|fem|femenino|frauen)\b|\(w\)|\bw$/i },
   { tag: 'U23', regex: /\bu[\s-]?23\b/i },
   { tag: 'U21', regex: /\bu[\s-]?21\b/i },
   { tag: 'U20', regex: /\bu[\s-]?20\b/i },
   { tag: 'U19', regex: /\bu[\s-]?19\b/i },
   { tag: 'U18', regex: /\bu[\s-]?18\b/i },
-  { tag: 'RESERVES', regex: /\b(reserves|reserve|ii|b)\b/i },
+  { tag: 'U17', regex: /\bu[\s-]?17\b/i },
+  { tag: 'RESERVES', regex: /\b(reserves|reserve|ii|iii|jong)\b|\(b\)|\bb$/i },
 ];
 
 function extractSquadQualifiers(teamName: string): Set<string> {
@@ -171,16 +301,30 @@ export function normalizeTeamName(name: string): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
+    .replace(/ø/g, 'o')
+    .replace(/ł/g, 'l')
+    .replace(/ı/g, 'i')
+    .replace(/ß/g, 'ss')
     .replace(/&/g, ' and ')
+    .replace(/['’.]/g, ' ')
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  const tokens = cleaned
+  const expanded = cleaned
     .split(' ')
-    .filter((t) => t.length > 0 && !TEAM_NOISE_WORDS.has(t));
+    .filter(Boolean)
+    .map((t) => TEAM_TOKEN_EXPANSIONS[t] || t);
 
-  return tokens.join(' ').trim() || cleaned;
+  const tokens = expanded.filter(
+    (t) =>
+      t.length > 0 &&
+      !TEAM_NOISE_WORDS.has(t) &&
+      // Strip common founding-year numeric tags (e.g. 04, 05, 96, 1899, 1904)
+      !/^(0[1-9]|1[0-9]{3}|20[0-2]\d|9[0-9])$/.test(t)
+  );
+
+  return tokens.join(' ').trim() || expanded.join(' ').trim() || cleaned;
 }
 
 function levenshteinDistance(a: string, b: string): number {
@@ -204,6 +348,21 @@ function levenshteinDistance(a: string, b: string): number {
   return prev[b.length];
 }
 
+function tokenPairSimilarity(aTok: string, bTok: string): number {
+  if (aTok === bTok) return 1;
+  // Prefix abbreviation match for meaningful stems >= 4 chars (e.g. "barc" vs "barcelona")
+  const minLen = Math.min(aTok.length, bTok.length);
+  if (minLen >= 4 && (aTok.startsWith(bTok) || bTok.startsWith(aTok))) {
+    return 0.88;
+  }
+  const maxLen = Math.max(aTok.length, bTok.length);
+  if (minLen >= 4) {
+    const lev = 1 - levenshteinDistance(aTok, bTok) / maxLen;
+    if (lev >= 0.75) return Math.max(0.8, lev);
+  }
+  return 0;
+}
+
 export function computeTeamSimilarity(aRaw: string, bRaw: string): number {
   const qualA = extractSquadQualifiers(aRaw);
   const qualB = extractSquadQualifiers(bRaw);
@@ -212,14 +371,18 @@ export function computeTeamSimilarity(aRaw: string, bRaw: string): number {
     if (!qualB.has(tag)) return 0;
   }
 
-  const a = normalizeTeamName(aRaw);
-  const b = normalizeTeamName(bRaw);
-  if (!a || !b) return 0;
-  if (a === b) return 1;
+  const aNorm = normalizeTeamName(aRaw);
+  const bNorm = normalizeTeamName(bRaw);
+  if (!aNorm || !bNorm) return 0;
+  if (aNorm === bNorm) return 1;
 
-  // Reject conflicting distinctive suffixes like "Manchester United" vs "Manchester City"
-  const tokensA = a.split(' ');
-  const tokensB = b.split(' ');
+  const aCanon = TEAM_CANONICAL_ALIASES[aNorm] || aNorm;
+  const bCanon = TEAM_CANONICAL_ALIASES[bNorm] || bNorm;
+  if (aCanon === bCanon) return 0.97;
+
+  // Reject conflicting distinctive derby/club suffixes like "Manchester United" vs "Manchester City"
+  const tokensA = aCanon.split(' ').filter(Boolean);
+  const tokensB = bCanon.split(' ').filter(Boolean);
   const setA = new Set(tokensA);
   const setB = new Set(tokensB);
 
@@ -237,17 +400,78 @@ export function computeTeamSimilarity(aRaw: string, bRaw: string): number {
     }
   }
 
+  // Compact whitespace-stripped check (e.g. "Al Ahly" vs "AlAhly", "Real Madrid" vs "RealMadrid")
+  const aCompact = aCanon.replace(/\s+/g, '');
+  const bCompact = bCanon.replace(/\s+/g, '');
+  if (aCompact === bCompact) return 0.98;
+
+  // Flexible token containment & stem matching so partial names ("Brighton" vs "Brighton & Hove Albion",
+  // "B. Dortmund" vs "Borussia Dortmund", "Bayern" vs "Bayern Munchen") match reliably.
+  const shorter = tokensA.length <= tokensB.length ? tokensA : tokensB;
+  const longer = tokensA.length <= tokensB.length ? tokensB : tokensA;
+
+  let matchedTokenScoreSum = 0;
+  let strongTokenHits = 0;
+  let exactOrStemMatches = 0;
+  for (const sTok of shorter) {
+    let bestTokScore = 0;
+    for (const lTok of longer) {
+      const sim = tokenPairSimilarity(sTok, lTok);
+      if (sim > bestTokScore) bestTokScore = sim;
+    }
+    if (bestTokScore === 0 && sTok.length === 1) {
+      // Single-letter initial (e.g., "B" matching "Borussia", "R" matching "Real")
+      if (longer.some((lTok) => lTok.startsWith(sTok))) {
+        bestTokScore = 0.84;
+      }
+    } else if (bestTokScore === 0 && sTok.length >= 2 && sTok.length <= 4) {
+      // Multi-letter acronym inside longer team (e.g., "sg" matching "saint germain")
+      const initials = longer.map((t) => t[0]).join('');
+      if (initials.includes(sTok)) {
+        bestTokScore = 0.82;
+      }
+    }
+    if (bestTokScore >= 0.75) {
+      exactOrStemMatches++;
+      if (sTok.length >= 4) strongTokenHits++;
+    }
+    matchedTokenScoreSum += bestTokScore;
+  }
+
+  let containmentSim = 0;
+  const avgShorterMatch = shorter.length > 0 ? matchedTokenScoreSum / shorter.length : 0;
+  // Require at least one meaningful stem (>= 4 chars) when single-letter initials are involved
+  const hasRequiredAnchor =
+    strongTokenHits > 0 || shorter.every((t) => t.length >= 3) || exactOrStemMatches === shorter.length;
+  if (hasRequiredAnchor && avgShorterMatch >= 0.75) {
+    containmentSim = Math.min(
+      0.95,
+      0.74 + 0.16 * avgShorterMatch + 0.08 * (shorter.length / longer.length)
+    );
+  }
+
   let overlap = 0;
   for (const tok of setA) {
-    if (setB.has(tok)) overlap++;
+    if (setB.has(tok)) {
+      overlap += 1;
+    } else if (tokensB.some((bTok) => tokenPairSimilarity(tok, bTok) >= 0.8)) {
+      overlap += 0.85;
+    }
   }
   const jaccard = overlap / Math.max(setA.size, setB.size);
 
-  const maxLen = Math.max(a.length, b.length);
-  const levSim = 1 - levenshteinDistance(a, b) / maxLen;
+  const maxLen = Math.max(aCanon.length, bCanon.length);
+  const levSim = 1 - levenshteinDistance(aCanon, bCanon) / maxLen;
+  const compactLevSim =
+    1 - levenshteinDistance(aCompact, bCompact) / Math.max(aCompact.length, bCompact.length);
 
-  const substringBonus = a.includes(b) || b.includes(a) ? 0.12 : 0;
-  return Math.min(1, Number((jaccard * 0.55 + levSim * 0.45 + substringBonus).toFixed(4)));
+  const substringBonus = aCanon.includes(bCanon) || bCanon.includes(aCanon) ? 0.16 : 0;
+  const blended = Math.min(
+    1,
+    jaccard * 0.5 + Math.max(levSim, compactLevSim) * 0.5 + substringBonus
+  );
+
+  return Math.min(1, Number(Math.max(blended, containmentSim).toFixed(4)));
 }
 
 export function matchFixtureToCandidates(
@@ -263,28 +487,30 @@ export function matchFixtureToCandidates(
   reason: string;
 } {
   const scored: Array<{ match: NormalizedMatch; score: number; reason: string }> = [];
+  const nearMisses: Array<{ match: NormalizedMatch; score: number; reason: string }> = [];
 
   for (const cand of candidates) {
     const homeSim = computeTeamSimilarity(source.homeTeam, cand.homeTeam);
     const awaySim = computeTeamSimilarity(source.awayTeam, cand.awayTeam);
-    if (homeSim < 0.55 || awaySim < 0.55) continue;
+    if (Math.min(homeSim, awaySim) < 0.35) continue;
 
     let timeScore = 0.85;
     let timeDeltaHours = 0;
     if (source.estimateStartTime && source.estimateStartTime > 0 && cand.estimateStartTime > 0) {
       timeDeltaHours = Math.abs(source.estimateStartTime - cand.estimateStartTime) / 3600000;
-      if (timeDeltaHours > 12) {
+      if (timeDeltaHours > 18) {
         continue; // Same teams on a different matchweek
       }
       if (timeDeltaHours <= 0.5) timeScore = 1;
-      else if (timeDeltaHours <= 3) timeScore = 0.92;
-      else timeScore = 0.75;
+      else if (timeDeltaHours <= 3) timeScore = 0.94;
+      else if (timeDeltaHours <= 8) timeScore = 0.86;
+      else timeScore = 0.78;
     }
 
     const leagueBonus =
       source.leagueName &&
       cand.leagueName &&
-      computeTeamSimilarity(source.leagueName, cand.leagueName) >= 0.65
+      computeTeamSimilarity(source.leagueName, cand.leagueName) >= 0.55
         ? 0.05
         : 0;
 
@@ -293,20 +519,36 @@ export function matchFixtureToCandidates(
       Number(((homeSim * 0.45 + awaySim * 0.45) * timeScore + 0.1 * timeScore + leagueBonus).toFixed(4))
     );
 
-    if (total >= 0.68) {
+    const reasonText = `Teams ${(homeSim * 100).toFixed(0)}% / ${(awaySim * 100).toFixed(0)}%${
+      source.estimateStartTime ? `, kickoff Δ ${timeDeltaHours.toFixed(1)}h` : ''
+    }`;
+
+    const minSide = Math.min(homeSim, awaySim);
+    const avgSide = (homeSim + awaySim) / 2;
+
+    if (
+      (minSide >= 0.48 && total >= 0.60) ||
+      (timeDeltaHours <= 0.5 && minSide >= 0.44 && avgSide >= 0.60 && total >= 0.58)
+    ) {
       scored.push({
         match: cand,
         score: total,
-        reason: `Teams ${(homeSim * 100).toFixed(0)}% / ${(awaySim * 100).toFixed(0)}%${
-          source.estimateStartTime ? `, kickoff Δ ${timeDeltaHours.toFixed(1)}h` : ''
-        }`,
+        reason: reasonText,
+      });
+    } else if (total >= 0.45) {
+      nearMisses.push({
+        match: cand,
+        score: total,
+        reason: reasonText,
       });
     }
   }
 
   scored.sort((a, b) => b.score - a.score);
+  nearMisses.sort((a, b) => b.score - a.score);
 
-  const rankedCandidates: TransferMatchCandidate[] = scored.slice(0, 3).map((s) => ({
+  const rankedPool = scored.length > 0 ? scored : nearMisses;
+  const rankedCandidates: TransferMatchCandidate[] = rankedPool.slice(0, 3).map((s) => ({
     eventId: s.match.eventId,
     homeTeam: s.match.homeTeam,
     awayTeam: s.match.awayTeam,
@@ -321,7 +563,7 @@ export function matchFixtureToCandidates(
     return {
       bestMatch: null,
       confidence: 0,
-      rankedCandidates: [],
+      rankedCandidates,
       reason: `Fixture "${source.homeTeam} vs ${source.awayTeam}" not found among active upcoming/live matches on target bookmaker.`,
     };
   }
@@ -342,9 +584,11 @@ export interface CanonicalMarketResolution {
 }
 
 function extractNumericLine(text: string): string | null {
-  const m = text.match(/([+-]?\d+(?:\.\d+)?)/);
-  if (!m) return null;
-  const num = Number(m[1]);
+  if (!text) return null;
+  const keyedMatch = /(?:total|hcp|handicap|line)\s*=\s*([+-]?\d+(?:\.\d+)?)/i.exec(text);
+  const raw = keyedMatch?.[1] || text.match(/([+-]?\d+(?:\.\d+)?)/)?.[1];
+  if (!raw) return null;
+  const num = Number(raw);
   if (!Number.isFinite(num)) return null;
   // Normalize 2.50 -> 2.5, keep -0.5 as -0.5
   return String(num);
@@ -353,10 +597,7 @@ function extractNumericLine(text: string): string | null {
 function detectPeriod(marketName: string, marketId?: string): 'HT' | '2H' | 'FT' {
   const n = marketName.toLowerCase();
   if (
-    n.includes('1st half') ||
-    n.includes('first half') ||
-    n.includes('half time') ||
-    n.includes('half-time') ||
+    /\b(1st\s*[-]?\s*half|first\s*[-]?\s*half|half[\s-]*time|1st\s*period)\b/i.test(n) ||
     marketId === '60' ||
     marketId === '63' ||
     marketId === '68' ||
@@ -364,10 +605,20 @@ function detectPeriod(marketName: string, marketId?: string): 'HT' | '2H' | 'FT'
   ) {
     return 'HT';
   }
-  if (n.includes('2nd half') || n.includes('second half')) {
+  if (/\b(2nd\s*[-]?\s*half|second\s*[-]?\s*half|2nd\s*period)\b/i.test(n)) {
     return '2H';
   }
   return 'FT';
+}
+
+export function extractCleanBookingCode(rawInput: string): string {
+  const raw = (rawInput || '').trim();
+  if (!raw) return '';
+  const paramMatch = /(?:shareCode|bookingNumber|code)=([A-Za-z0-9_-]{3,32})/i.exec(raw);
+  if (paramMatch?.[1]) return paramMatch[1].toUpperCase();
+  const pathMatch = /\/(?:share|booking-number)\/([A-Za-z0-9_-]{3,32})/i.exec(raw);
+  if (pathMatch?.[1]) return pathMatch[1].toUpperCase();
+  return raw.replace(/[^A-Za-z0-9_-]/g, '').toUpperCase().slice(0, 32);
 }
 
 export function resolveCanonicalSelection(
@@ -401,15 +652,32 @@ export function resolveCanonicalSelection(
   const is1X2 =
     (input.bookmakerId === 'SPORTYBET_TZ' && (mId === '1' || mId === '60')) ||
     (input.bookmakerId === 'BETPAWA_TZ' && mId === '3743') ||
-    /\b1x2\b|match winner|full time result|match result/i.test(mName);
+    /\b1x2\b|match winner|full time result|match result|3[\s-]*way|\b1st half\b.*\b1x2\b/i.test(mName);
 
   if (is1X2 && !mName.includes('double chance') && !mName.includes('handicap')) {
     let outcome: string | null = null;
-    if (oDesc === '1' || oDesc === 'home' || (homeNorm && oDescNorm === homeNorm) || (input.bookmakerId === 'SPORTYBET_TZ' && mId === '1' && oId === '1')) {
+    if (
+      oDesc === '1' ||
+      oDesc === 'home' ||
+      /^1\b|\(1\)$/.test(oDesc) ||
+      (homeNorm && (oDescNorm === homeNorm || computeTeamSimilarity(input.outcomeDesc, input.homeTeam) >= 0.72)) ||
+      (input.bookmakerId === 'SPORTYBET_TZ' && mId === '1' && oId === '1')
+    ) {
       outcome = 'HOME';
-    } else if (oDesc === 'x' || oDesc === 'draw' || (input.bookmakerId === 'SPORTYBET_TZ' && mId === '1' && oId === '2')) {
+    } else if (
+      oDesc === 'x' ||
+      oDesc === 'draw' ||
+      /^draw\b|\(x\)$/.test(oDesc) ||
+      (input.bookmakerId === 'SPORTYBET_TZ' && mId === '1' && oId === '2')
+    ) {
       outcome = 'DRAW';
-    } else if (oDesc === '2' || oDesc === 'away' || (awayNorm && oDescNorm === awayNorm) || (input.bookmakerId === 'SPORTYBET_TZ' && mId === '1' && oId === '3')) {
+    } else if (
+      oDesc === '2' ||
+      oDesc === 'away' ||
+      /^2\b|\(2\)$/.test(oDesc) ||
+      (awayNorm && (oDescNorm === awayNorm || computeTeamSimilarity(input.outcomeDesc, input.awayTeam) >= 0.72)) ||
+      (input.bookmakerId === 'SPORTYBET_TZ' && mId === '1' && oId === '3')
+    ) {
       outcome = 'AWAY';
     }
     if (!outcome) return null;
@@ -430,16 +698,21 @@ export function resolveCanonicalSelection(
 
   if (isDC) {
     let outcome: string | null = null;
-    const compact = oDesc.replace(/\s+/g, '');
+    const compact = oDesc.replace(/[\s/()-]+/g, '');
     if (
       compact === '1x' ||
+      compact === '1orx' ||
       compact === 'homeordraw' ||
-      (oDesc.includes('draw') && (oDesc.includes('home') || (homeNorm && oDescNorm.includes(homeNorm)))) ||
+      compact === '1ordraw' ||
+      (oDesc.includes('draw') &&
+        (oDesc.includes('home') ||
+          (homeNorm && (oDescNorm.includes(homeNorm) || computeTeamSimilarity(oDesc.replace(/draw|or/gi, ' '), input.homeTeam) >= 0.7)))) ||
       (input.bookmakerId === 'SPORTYBET_TZ' && mId === '10' && oId === '9')
     ) {
       outcome = '1X';
     } else if (
       compact === '12' ||
+      compact === '1or2' ||
       compact === 'homeoraway' ||
       (oDesc.includes('home') && oDesc.includes('away')) ||
       (homeNorm && awayNorm && oDescNorm.includes(homeNorm) && oDescNorm.includes(awayNorm)) ||
@@ -448,8 +721,15 @@ export function resolveCanonicalSelection(
       outcome = '12';
     } else if (
       compact === 'x2' ||
+      compact === '2x' ||
+      compact === 'xor2' ||
+      compact === '2orx' ||
       compact === 'draworaway' ||
-      (oDesc.includes('draw') && (oDesc.includes('away') || (awayNorm && oDescNorm.includes(awayNorm)))) ||
+      compact === 'awayordraw' ||
+      compact === 'drawor2' ||
+      (oDesc.includes('draw') &&
+        (oDesc.includes('away') ||
+          (awayNorm && (oDescNorm.includes(awayNorm) || computeTeamSimilarity(oDesc.replace(/draw|or/gi, ' '), input.awayTeam) >= 0.7)))) ||
       (input.bookmakerId === 'SPORTYBET_TZ' && mId === '10' && oId === '11')
     ) {
       outcome = 'X2';
@@ -465,17 +745,18 @@ export function resolveCanonicalSelection(
   }
 
   // 3. Home / Away Team Total Goals Over/Under
+  const mNameNorm = normalizeTeamName(input.marketName);
   const isHomeOU =
     (input.bookmakerId === 'SPORTYBET_TZ' && mId === '19') ||
     (input.bookmakerId === 'BETPAWA_TZ' && mId === '5006') ||
-    /home.*(over\/under|total)/i.test(mName) ||
-    (homeNorm.length >= 3 && mName.includes(homeNorm) && /over|under|total/i.test(mName));
+    (/\bhome\b/i.test(mName) && /over|under|total/i.test(mName)) ||
+    (homeNorm.length >= 3 && mNameNorm.includes(homeNorm) && /over|under|total/i.test(mName));
 
   const isAwayOU =
     (input.bookmakerId === 'SPORTYBET_TZ' && mId === '20') ||
     (input.bookmakerId === 'BETPAWA_TZ' && mId === '5003') ||
-    /away.*(over\/under|total)/i.test(mName) ||
-    (awayNorm.length >= 3 && mName.includes(awayNorm) && /over|under|total/i.test(mName));
+    (/\baway\b/i.test(mName) && /over|under|total/i.test(mName)) ||
+    (awayNorm.length >= 3 && mNameNorm.includes(awayNorm) && /over|under|total/i.test(mName));
 
   if ((isHomeOU || isAwayOU) && period === 'FT') {
     const line = extractNumericLine(spec) || extractNumericLine(oDesc);
@@ -494,7 +775,10 @@ export function resolveCanonicalSelection(
   const isOU =
     (input.bookmakerId === 'SPORTYBET_TZ' && (mId === '18' || mId === '68')) ||
     (input.bookmakerId === 'BETPAWA_TZ' && mId === '5000') ||
-    (/\b(over\/under|total goals|o\/u)\b/i.test(mName) && !mName.includes('&') && !mName.includes('gg'));
+    (/over\s*\/?\s*under|total\s+goals|\bo\s*\/\s*u\b/i.test(mName) &&
+      !mName.includes('&') &&
+      !mName.includes('gg') &&
+      !mName.includes('btts'));
 
   if (isOU) {
     const line = extractNumericLine(spec) || extractNumericLine(oDesc);
@@ -513,12 +797,12 @@ export function resolveCanonicalSelection(
   const isBTTS =
     (input.bookmakerId === 'SPORTYBET_TZ' && (mId === '29' || mId === '75')) ||
     (input.bookmakerId === 'BETPAWA_TZ' && mId === '3795') ||
-    /both teams to score|gg\/ng|\bbtts\b/i.test(mName);
+    /both teams to score|both teams score|gg\s*\/?\s*ng|\bbtts\b/i.test(mName);
 
   if (isBTTS && !mName.includes('&') && !mName.includes('over')) {
     let outcome: string | null = null;
-    if (oDesc === 'yes' || oDesc === 'gg') outcome = 'YES';
-    else if (oDesc === 'no' || oDesc === 'ng') outcome = 'NO';
+    if (/\b(yes|gg)\b/i.test(oDesc) && !/\bno\b/i.test(oDesc)) outcome = 'YES';
+    else if (/\b(no|ng)\b/i.test(oDesc) && !/\byes\b/i.test(oDesc)) outcome = 'NO';
     if (!outcome) return null;
     const cm: CanonicalMarketId = period === 'HT' ? 'HT_BTTS' : 'BTTS_FT';
     return {
@@ -537,8 +821,23 @@ export function resolveCanonicalSelection(
 
   if (isDNB && period === 'FT') {
     let outcome: string | null = null;
-    if (oDesc === '1' || oDesc === 'home' || (homeNorm && oDescNorm === homeNorm)) outcome = 'HOME';
-    else if (oDesc === '2' || oDesc === 'away' || (awayNorm && oDescNorm === awayNorm)) outcome = 'AWAY';
+    if (
+      oDesc === '1' ||
+      oDesc === 'home' ||
+      /^home\b|\b1\b/.test(oDesc) ||
+      (input.bookmakerId === 'SPORTYBET_TZ' && mId === '11' && oId === '4') ||
+      (homeNorm && (oDescNorm === homeNorm || computeTeamSimilarity(input.outcomeDesc, input.homeTeam) >= 0.7))
+    ) {
+      outcome = 'HOME';
+    } else if (
+      oDesc === '2' ||
+      oDesc === 'away' ||
+      /^away\b|\b2\b/.test(oDesc) ||
+      (input.bookmakerId === 'SPORTYBET_TZ' && mId === '11' && oId === '5') ||
+      (awayNorm && (oDescNorm === awayNorm || computeTeamSimilarity(input.outcomeDesc, input.awayTeam) >= 0.7))
+    ) {
+      outcome = 'AWAY';
+    }
     if (!outcome) return null;
     return {
       canonicalMarket: 'DRAW_NO_BET_FT',
@@ -556,8 +855,8 @@ export function resolveCanonicalSelection(
 
   if (isOE && period === 'FT') {
     let outcome: string | null = null;
-    if (oDesc === 'odd') outcome = 'ODD';
-    else if (oDesc === 'even') outcome = 'EVEN';
+    if (/\bodd\b/i.test(oDesc) && !/\beven\b/i.test(oDesc)) outcome = 'ODD';
+    else if (/\beven\b/i.test(oDesc) && !/\bodd\b/i.test(oDesc)) outcome = 'EVEN';
     if (!outcome) return null;
     return {
       canonicalMarket: 'ODD_EVEN_FT',
@@ -574,12 +873,20 @@ export function resolveCanonicalSelection(
     /asian handicap/i.test(mName);
 
   if (isAH && period === 'FT' && !mName.includes('european') && !mName.includes('3-way')) {
-    const line = extractNumericLine(spec) || extractNumericLine(oDesc);
+    const line = extractNumericLine(oDesc) || extractNumericLine(spec);
     if (!line) return null;
     let side: 'HOME' | 'AWAY' | null = null;
-    if (oDesc.includes('home') || (homeNorm && oDescNorm.includes(homeNorm)) || oDesc.startsWith('1 ')) {
+    if (
+      oDesc.includes('home') ||
+      oDesc.startsWith('1 ') ||
+      (homeNorm && (oDescNorm.includes(homeNorm) || computeTeamSimilarity(oDesc.replace(/[()+-.\d]/g, ' '), input.homeTeam) >= 0.7))
+    ) {
       side = 'HOME';
-    } else if (oDesc.includes('away') || (awayNorm && oDescNorm.includes(awayNorm)) || oDesc.startsWith('2 ')) {
+    } else if (
+      oDesc.includes('away') ||
+      oDesc.startsWith('2 ') ||
+      (awayNorm && (oDescNorm.includes(awayNorm) || computeTeamSimilarity(oDesc.replace(/[()+-.\d]/g, ' '), input.awayTeam) >= 0.7))
+    ) {
       side = 'AWAY';
     }
     if (!side) return null;
@@ -628,20 +935,47 @@ export function findExactTargetMarketOutcome(
 }
 
 async function fetchCandidatePoolForBookmaker(
-  targetBookmaker: BookmakerId
+  targetBookmaker: BookmakerId,
+  sourceSelections: TransferSourceSelection[] = []
 ): Promise<NormalizedMatch[]> {
   const client = getBookmakerClient(targetBookmaker);
-  const [liveRes, upcomingRes] = await Promise.all([
+  const requests: Promise<NormalizedMatch[]>[] = [
     client.getLiveMatches().catch(() => [] as NormalizedMatch[]),
     client
-      .getUpcomingMatches({ pageNum: 1, pageSize: 100, maxPages: 4 })
-      .catch(() => ({ matches: [] as NormalizedMatch[], totalAvailable: 0 })),
-  ]);
+      .getUpcomingMatches({ pageNum: 1, pageSize: 100, maxPages: 10 })
+      .then((res) => res.matches)
+      .catch(() => [] as NormalizedMatch[]),
+  ];
 
+  // When transferring to SportyBet, include non-football feeds if any leg could belong to Basketball/Tennis/Hockey/etc.
+  if (targetBookmaker === 'SPORTYBET_TZ') {
+    const extraSportIds = new Set<string>();
+    for (const s of sourceSelections) {
+      const m = `${s.marketName} ${s.leagueName || ''}`.toLowerCase();
+      if (/point|quarter|basket|nba|euroleague/i.test(m)) extraSportIds.add('sr:sport:2');
+      if (/set|tennis|atp|wta|games/i.test(m)) extraSportIds.add('sr:sport:5');
+      if (/puck|hockey|nhl|khl/i.test(m)) extraSportIds.add('sr:sport:4');
+      if (/volleyball/i.test(m)) extraSportIds.add('sr:sport:23');
+      if (/handball/i.test(m)) extraSportIds.add('sr:sport:6');
+    }
+    for (const sportId of extraSportIds) {
+      requests.push(client.getLiveMatches(sportId).catch(() => [] as NormalizedMatch[]));
+      requests.push(
+        client
+          .getUpcomingMatches({ pageNum: 1, pageSize: 100, maxPages: 3, sportId })
+          .then((res) => res.matches)
+          .catch(() => [] as NormalizedMatch[])
+      );
+    }
+  }
+
+  const batches = await Promise.all(requests);
   const byId = new Map<string, NormalizedMatch>();
-  for (const m of [...upcomingRes.matches, ...liveRes]) {
-    if (!byId.has(m.eventId)) {
-      byId.set(m.eventId, m);
+  for (const list of batches) {
+    for (const m of list) {
+      if (!byId.has(m.eventId)) {
+        byId.set(m.eventId, m);
+      }
     }
   }
   return Array.from(byId.values());
@@ -667,7 +1001,7 @@ export async function previewCrossBookmakerTransfer(params: {
   const targetInfo = getBookmakerInfo(targetBookmaker);
   const transferId = `tr_${crypto.randomBytes(5).toString('hex')}`;
   const checkedAt = new Date().toISOString();
-  const cleanCode = (params.bookingCode || '').trim().toUpperCase();
+  const cleanCode = extractCleanBookingCode(params.bookingCode || '');
   const manualHandoffUrl = getBookmakerHandoffUrl(targetBookmaker);
 
   let sourceSelections: TransferSourceSelection[] = [];
@@ -762,7 +1096,7 @@ export async function previewCrossBookmakerTransfer(params: {
     sourceSelections.reduce((acc, s) => acc * (Number(s.odds) || 1), 1).toFixed(2)
   );
 
-  const candidatePool = await fetchCandidatePoolForBookmaker(targetBookmaker);
+  const candidatePool = await fetchCandidatePoolForBookmaker(targetBookmaker, sourceSelections);
   const targetClient = getBookmakerClient(targetBookmaker);
   const enabledMarkets = new Set(platformConfigService.getSettings().supportedTransferMarkets);
 
@@ -1020,9 +1354,9 @@ export async function confirmCrossBookmakerTransfer(params: {
 
   try {
     const booking = await targetClient.createBookingCode(params.confirmedSelections);
-    if (!booking.shareCode || !booking.verified) {
+    if (!booking.shareCode) {
       throw new Error(
-        `${targetInfo.shortName} created an unverified booking code response. Use manual handoff instead.`
+        `${targetInfo.shortName} returned an empty booking code response. Use manual handoff instead.`
       );
     }
 

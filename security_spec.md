@@ -6,6 +6,7 @@
 3. **Path Variable Hardening**: Every document ID (`userId`, `scanId`, `codeId`, `presetId`, `favoriteId`, `notificationId`, `transferId`) must match `^[a-zA-Z0-9_-]+$` and be `<= 128` characters.
 4. **Temporal Integrity**: `createdAt` must equal `request.time` on creation and remain immutable on updates. `updatedAt` must equal `request.time` on creation and update.
 5. **Volumetric & Schema Bounds**: Every string has strict min/max `.size()` limits, every array has strict `.size() <= MAX` limits, and every document enforces `keys().hasAll(...) && keys().hasOnly(...)` on creation plus `affectedKeys().hasOnly(...)` on update.
+6. **Public Daily Feed Immutability & Terminal Lock**: `/publicTickets/{ticketId}` documents are strictly create-once (`allow update: if false`) with validated `feedSection` (`UPCOMING`, `LIVE_FOOTBALL`, `OTHER_SPORTS`), `sportId`, `sportName`, and `replacedTicketId`. Mutable `/publicTicketUpdates/{ticketId}` documents lock permanently once `status` reaches `WON`, `LOST`, or `VOID`. Admin targets enforce `liveFootballTarget >= 10` and `otherSportsTarget >= 10`.
 
 ## 2. The "Dirty Dozen" Attack Payloads (All Must Yield `PERMISSION_DENIED`)
 1. **Unauthenticated Write**: Creating `/users/userA/scanHistory/scan1` with `request.auth == null`.

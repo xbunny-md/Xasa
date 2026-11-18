@@ -40,6 +40,8 @@ export type SelectionSettlementStatus =
   | 'VOID'
   | 'UNVERIFIED';
 
+export type FeedSection = 'UPCOMING' | 'LIVE_FOOTBALL' | 'OTHER_SPORTS';
+
 export type BookingCodeStatus = 'GENERATED' | 'FAILED' | 'NOT_REQUESTED';
 
 export interface MarketCatalogItem {
@@ -72,6 +74,8 @@ export interface NormalizedMarket {
 export interface NormalizedMatch {
   bookmakerId?: BookmakerId;
   bookmakerName?: string;
+  sportId?: string;
+  sportName?: string;
   eventId: string;
   gameId: string;
   homeTeam: string;
@@ -113,6 +117,8 @@ export interface ScannerConfig {
 export interface QualifyingSelection {
   bookmakerId?: BookmakerId;
   bookmakerName?: string;
+  sportId?: string;
+  sportName?: string;
   selectionKey: string;
   eventId: string;
   homeTeam: string;
@@ -152,6 +158,8 @@ export interface ScanResult {
 export interface BetslipSelection {
   bookmakerId?: BookmakerId;
   bookmakerName?: string;
+  sportId?: string;
+  sportName?: string;
   selectionKey: string;
   eventId: string;
   homeTeam: string;
@@ -287,6 +295,10 @@ export interface GeneratedTicket {
   bookmakerId?: BookmakerId;
   bookmakerName?: string;
   bookmakerUrl?: string;
+  feedSection?: FeedSection;
+  sportId?: string;
+  sportName?: string;
+  replacedTicketId?: string | null;
   signature: string;
   sourceType: 'DAILY_FACTORY' | 'ADMIN_MANUAL';
   categoryId: string;
@@ -324,6 +336,9 @@ export interface DailyFactoryConfig {
   minIndividualOdds: number; // Strictly 1.01 by default
   maxIndividualOdds: number; // Strictly 1.25 by default
   dailyTicketTarget: number; // Default >= 50 (e.g. 55)
+  liveFootballTarget?: number; // Default >= 10 (e.g. 12)
+  otherSportsTarget?: number; // Default >= 10 (e.g. 12)
+  autoReplenishOnSettle?: boolean; // Automatically generate new upcoming code when an active one finishes
   maxTickets: number;
   minSelections: number;
   maxSelections: number;
@@ -379,6 +394,12 @@ export interface SchedulerStatus {
   nextFactoryRunAt: string | null;
   totalDailyTicketsToday: number;
   dailyTicketTarget: number;
+  liveFootballCount?: number;
+  otherSportsCount?: number;
+  upcomingActiveCount?: number;
+  settledWonCount?: number;
+  settledLostCount?: number;
+  settledVoidCount?: number;
   bookingCodesGeneratedToday: number;
   bookingCodeFailuresToday: number;
   dailyShortfallReason: string | null;

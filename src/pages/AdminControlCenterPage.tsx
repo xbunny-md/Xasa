@@ -376,7 +376,7 @@ export function AdminControlCenterPage() {
           <div className="space-y-6">
             {/* Scheduler Lifecycle Bar */}
             <section className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] p-5 flex flex-wrap items-center justify-between gap-4 shadow-xs dark:shadow-none">
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 text-xs">
                 <div>
                   <span className="text-slate-500 block">Scheduler State</span>
                   <span className="font-mono font-semibold text-slate-900 dark:text-white">
@@ -388,10 +388,40 @@ export function AdminControlCenterPage() {
                   </span>
                 </div>
                 <div>
-                  <span className="text-slate-500 block">Today&apos;s Tickets</span>
+                  <span className="text-slate-500 block">Upcoming Feed</span>
                   <span className="font-mono font-semibold text-blue-700 dark:text-blue-300 tabular-nums">
-                    {schedulerStatus?.totalDailyTicketsToday ?? 0} /{' '}
+                    {schedulerStatus?.upcomingActiveCount ?? 0} active /{' '}
                     {factoryConfig.dailyTicketTarget}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Live Football</span>
+                  <span className="font-mono font-semibold text-amber-700 dark:text-amber-300 tabular-nums">
+                    {schedulerStatus?.liveFootballCount ?? 0} /{' '}
+                    {factoryConfig.liveFootballTarget ?? 12}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Other Games</span>
+                  <span className="font-mono font-semibold text-purple-700 dark:text-purple-300 tabular-nums">
+                    {schedulerStatus?.otherSportsCount ?? 0} /{' '}
+                    {factoryConfig.otherSportsTarget ?? 12}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Settled W / L / V</span>
+                  <span className="font-mono font-semibold tabular-nums">
+                    <span className="text-emerald-700 dark:text-emerald-300">
+                      {schedulerStatus?.settledWonCount ?? 0}W
+                    </span>{' '}
+                    /{' '}
+                    <span className="text-rose-700 dark:text-rose-300">
+                      {schedulerStatus?.settledLostCount ?? 0}L
+                    </span>{' '}
+                    /{' '}
+                    <span className="text-slate-600 dark:text-slate-300">
+                      {schedulerStatus?.settledVoidCount ?? 0}V
+                    </span>
                   </span>
                 </div>
                 <div>
@@ -400,14 +430,6 @@ export function AdminControlCenterPage() {
                     {schedulerStatus?.lastFactoryRunAt
                       ? formatDateTimeCompact(schedulerStatus.lastFactoryRunAt)
                       : 'Pending'}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-slate-500 block">Next Run</span>
-                  <span className="font-mono text-slate-700 dark:text-slate-300">
-                    {schedulerStatus?.nextFactoryRunAt
-                      ? formatDateTimeCompact(schedulerStatus.nextFactoryRunAt)
-                      : 'Manual / Paused'}
                   </span>
                 </div>
               </div>
@@ -515,7 +537,7 @@ export function AdminControlCenterPage() {
                 </label>
                 <label className="space-y-1">
                   <span className="text-slate-600 dark:text-slate-400 block">
-                    Daily Ticket Target
+                    Upcoming Ticket Target
                   </span>
                   <input
                     type="number"
@@ -524,6 +546,42 @@ export function AdminControlCenterPage() {
                     value={draft.dailyTicketTarget}
                     onChange={(e) =>
                       setDraft({ ...draft, dailyTicketTarget: Number(e.target.value) || 55 })
+                    }
+                    className="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-white font-mono"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-600 dark:text-slate-400 block">
+                    Live Football Target (Min 10)
+                  </span>
+                  <input
+                    type="number"
+                    min="10"
+                    max="100"
+                    value={draft.liveFootballTarget ?? 12}
+                    onChange={(e) =>
+                      setDraft({
+                        ...draft,
+                        liveFootballTarget: Math.max(10, Number(e.target.value) || 12),
+                      })
+                    }
+                    className="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-white font-mono"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-600 dark:text-slate-400 block">
+                    Other Games Target (Min 10)
+                  </span>
+                  <input
+                    type="number"
+                    min="10"
+                    max="100"
+                    value={draft.otherSportsTarget ?? 12}
+                    onChange={(e) =>
+                      setDraft({
+                        ...draft,
+                        otherSportsTarget: Math.max(10, Number(e.target.value) || 12),
+                      })
                     }
                     className="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-white font-mono"
                   />
@@ -619,6 +677,17 @@ export function AdminControlCenterPage() {
                     className="rounded border-slate-300 dark:border-white/20 bg-white dark:bg-[#090D16]"
                   />
                   <span>Automatically Create {draftBookmakerLabel} Booking Codes</span>
+                </label>
+                <label className="inline-flex items-center gap-2 text-slate-700 dark:text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.autoReplenishOnSettle !== false}
+                    onChange={(e) =>
+                      setDraft({ ...draft, autoReplenishOnSettle: e.target.checked })
+                    }
+                    className="rounded border-slate-300 dark:border-white/20 bg-white dark:bg-[#090D16]"
+                  />
+                  <span>Auto-Create Replacement Code When Upcoming Code Settles (WON/LOST/VOID)</span>
                 </label>
                 <label className="inline-flex items-center gap-2 text-slate-700 dark:text-slate-200 cursor-pointer">
                   <input
@@ -813,22 +882,30 @@ export function AdminControlCenterPage() {
                         </div>
                         <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
                           {t.bookmakerId === 'BETPAWA_TZ' ? 'betPawa TZ' : 'SportyBet TZ'} ·{' '}
-                          {t.status} ·{' '}
+                          {t.feedSection === 'LIVE_FOOTBALL'
+                            ? 'Live Football'
+                            : t.feedSection === 'OTHER_SPORTS'
+                              ? t.sportName || 'Other Games'
+                              : 'Upcoming'}{' '}
+                          · {t.status} ·{' '}
                           {t.shareCode ? `Code: ${t.shareCode}` : t.bookingCodeError || 'No code'}
                         </div>
                       </button>
                       <div className="flex items-center gap-1.5 shrink-0">
-                        {!t.shareCode && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void createBookingCodeForTicket(t.internalTicketId).catch(() => {})
-                            }
-                            className="px-2 py-1 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-500/30 text-[10px]"
-                          >
-                            Retry Code
-                          </button>
-                        )}
+                        {!t.shareCode &&
+                          t.status !== 'WON' &&
+                          t.status !== 'LOST' &&
+                          t.status !== 'VOID' && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void createBookingCodeForTicket(t.internalTicketId).catch(() => {})
+                              }
+                              className="px-2 py-1 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-500/30 text-[10px]"
+                            >
+                              Retry Code
+                            </button>
+                          )}
                         <button
                           type="button"
                           onClick={() => void deletePortfolioTicket(t.internalTicketId)}
