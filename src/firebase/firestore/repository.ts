@@ -13,12 +13,16 @@ import { handleFirestoreError, OperationType } from './errors.ts';
 import type {
   AutomationJobLog,
   BetslipSelection,
+  BookmakerFeedState,
   BookmakerId,
   BookingCodeResponse,
   BookingCodeStatus,
   DailyFactoryConfig,
+  FeedLockStatus,
   FeedSection,
   GeneratedTicket,
+  GenerationCycle,
+  MatchResultRecord,
   MatchStatusFilter,
   QualifyingSelection,
   ScanResult,
@@ -155,6 +159,8 @@ export interface PublicTicketDocRecord {
   internalTicketId: string;
   signature: string;
   bookmakerId?: BookmakerId;
+  cycleId?: string;
+  idempotencyKey?: string;
   feedSection?: FeedSection;
   sportId?: string;
   sportName?: string;
@@ -177,8 +183,13 @@ export interface PublicTicketUpdateDocRecord {
   id: string;
   isPublic: boolean;
   internalTicketId: string;
+  bookmakerId?: BookmakerId;
+  cycleId?: string;
   status: TicketStatus | string;
   effectiveCombinedOdds: number;
+  settledMatchCount?: number;
+  totalMatchCount?: number;
+  unfinishedMatchCount?: number;
   shareCode: string;
   shareUrl: string;
   shareCodeVerified: boolean;
@@ -219,17 +230,43 @@ export interface AdminSettingsDocRecord {
 export interface PublicStatsDocRecord {
   id: string;
   isPublic: boolean;
+  bookmakerId?: BookmakerId;
+  activeCycleId?: string;
+  generationLocked?: boolean;
+  lockStatus?: FeedLockStatus;
+  lockReason?: string;
   dailyTicketTarget: number;
   totalGeneratedToday: number;
   bookingCodesGeneratedToday: number;
   liveFootballCount?: number;
   otherSportsCount?: number;
   upcomingActiveCount?: number;
+  unfinishedMatchesCount?: number;
+  unsettledTicketsCount?: number;
   settledWonCount?: number;
   settledLostCount?: number;
   settledVoidCount?: number;
   lastScanningAt: string;
   lastSettlementAt: string;
+  updatedAt?: Timestamp | string;
+}
+
+export interface BookmakerFeedStateDocRecord extends Omit<BookmakerFeedState, 'updatedAt'> {
+  id: string;
+  isPublic: boolean;
+  updatedAt?: Timestamp | string;
+}
+
+export interface FeedCycleDocRecord extends Omit<GenerationCycle, 'createdAt' | 'updatedAt'> {
+  id: string;
+  isPublic: boolean;
+  createdAt?: Timestamp | string;
+  updatedAt?: Timestamp | string;
+}
+
+export interface MatchResultDocRecord extends Omit<MatchResultRecord, 'updatedAt'> {
+  id: string;
+  isPublic: boolean;
   updatedAt?: Timestamp | string;
 }
 
@@ -671,86 +708,181 @@ export async function deleteTransferRecord(uid: string, transferId: string): Pro
 // ADMIN-ONLY MIRRORING FOR SHARED PUBLIC TICKETS & AUDIT LOGS
 // ==================================================
 
+const inFlightTicketSyncs = new Map<string, Promise<void>>();
+const inFlightCycleSyncs = new Map<string, Promise<void>>();
+
+function toFiniteBounded(value: unknown, min: number, max: number, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function sanitizeJsonMaps<T>(items: T[], limitCount = 30): Record<string, unknown>[] {
+  try {
+    return JSON.parse(JSON.stringify(items.slice(0, limitCount))) as Record<string, unknown>[];
+  } catch {
+    return [];
+  }
+}
+
 export async function syncPublicTicketBundle(
   adminUid: string,
   ticket: GeneratedTicket
 ): Promise<void> {
   const safeId = sanitizeTicketDocId(ticket.internalTicketId);
-  const ticketRef = doc(db, 'publicTickets', safeId);
-  const updateRef = doc(db, 'publicTicketUpdates', safeId);
-  const path = `publicTickets/${safeId}`;
+  if (!safeId || !Array.isArray(ticket.selections) || ticket.selections.length === 0) {
+    return;
+  }
 
-  try {
-    const existingTicket = await getDoc(ticketRef);
-    if (!existingTicket.exists()) {
-      const feedSection: FeedSection =
-        ticket.feedSection === 'LIVE_FOOTBALL' || ticket.feedSection === 'OTHER_SPORTS'
-          ? ticket.feedSection
-          : 'UPCOMING';
-      const cleanSportId = clampString(ticket.sportId || '', 40);
-      const cleanSportName = clampString(ticket.sportName || '', 60);
-      const cleanReplacedId = clampString(ticket.replacedTicketId || '', 64);
+  const prevInFlight = inFlightTicketSyncs.get(safeId) || Promise.resolve();
+  const run = prevInFlight
+    .catch(() => {})
+    .then(async () => {
+      const ticketRef = doc(db, 'publicTickets', safeId);
+      const updateRef = doc(db, 'publicTicketUpdates', safeId);
+      let currentPath = `publicTickets/${safeId}`;
+      let currentOp = OperationType.WRITE;
 
-      const ticketPayload: Record<string, unknown> = {
-        isPublic: true,
-        publishedByUid: adminUid,
-        internalTicketId: safeId,
-        signature: clampString(ticket.signature, 160, safeId),
-        bookmakerId: ticket.bookmakerId === 'BETPAWA_TZ' ? 'BETPAWA_TZ' : 'SPORTYBET_TZ',
-        feedSection,
-        sourceType: ticket.sourceType === 'ADMIN_MANUAL' ? 'ADMIN_MANUAL' : 'DAILY_FACTORY',
-        categoryId: clampString(ticket.categoryId, 40, 'cat_2_3'),
-        categoryLabel: clampString(ticket.categoryLabel, 60, '2.00-3.00'),
-        targetOdds: Math.max(1.01, Math.min(100000, ticket.targetOdds)),
-        actualCombinedOdds: Math.max(1.01, Math.min(1000000, ticket.actualCombinedOdds)),
-        selectionCount: Math.max(1, Math.min(30, ticket.selectionCount)),
-        kickoffStartMs: Math.max(0, Number(ticket.kickoffStartMs || 0)),
-        kickoffEndMs: Math.max(
-          Math.max(0, Number(ticket.kickoffStartMs || 0)),
-          Number(ticket.kickoffEndMs || ticket.kickoffStartMs || 0)
-        ),
-        dataSource: clampString(ticket.dataSource, 120, 'SportyBet TZ'),
-        generatedDateKey: clampString(ticket.generatedDateKey, 20, '2026-01-01'),
-        originalSelections: ticket.selections.slice(0, 30),
-        createdAt: serverTimestamp(),
-      };
+      const cleanSelections = sanitizeJsonMaps(ticket.selections, 30);
+      if (cleanSelections.length === 0) return;
+      const cleanSettlements = sanitizeJsonMaps(ticket.selectionSettlements || [], 30);
 
-      if (cleanSportId) ticketPayload.sportId = cleanSportId;
-      if (cleanSportName) ticketPayload.sportName = cleanSportName;
-      if (cleanReplacedId) ticketPayload.replacedTicketId = cleanReplacedId;
+      const totalMatchCount = cleanSelections.length;
+      const settledMatchCount = (ticket.selectionSettlements || []).filter(
+        (s) => s.status === 'WON' || s.status === 'LOST' || s.status === 'VOID'
+      ).length;
+      const unfinishedMatchCount = Math.max(0, totalMatchCount - settledMatchCount);
+      const bkId: BookmakerId = ticket.bookmakerId === 'BETPAWA_TZ' ? 'BETPAWA_TZ' : 'SPORTYBET_TZ';
 
-      await setDoc(ticketRef, ticketPayload);
-    }
+      try {
+        currentOp = OperationType.GET;
+        const existingTicket = await getDoc(ticketRef);
+        if (!existingTicket.exists()) {
+          currentOp = OperationType.CREATE;
+          const feedSection: FeedSection =
+            ticket.feedSection === 'LIVE_FOOTBALL' || ticket.feedSection === 'OTHER_SPORTS'
+              ? ticket.feedSection
+              : 'UPCOMING';
+          const cleanSportId = clampString(ticket.sportId || '', 40);
+          const cleanSportName = clampString(ticket.sportName || '', 60);
+          const cleanReplacedId = clampString(ticket.replacedTicketId || '', 64);
+          const cleanCycleId = clampString(ticket.cycleId || '', 80);
+          const cleanIdempotencyKey = clampString(ticket.idempotencyKey || '', 160);
+          const kickoffStartMs = toFiniteBounded(ticket.kickoffStartMs, 0, Number.MAX_SAFE_INTEGER, 0);
+          const kickoffEndMs = Math.max(
+            kickoffStartMs,
+            toFiniteBounded(ticket.kickoffEndMs, kickoffStartMs, Number.MAX_SAFE_INTEGER, kickoffStartMs)
+          );
 
-    const existingUpdate = await getDoc(updateRef);
-    const mutableFields = {
-      status: ticket.status,
-      effectiveCombinedOdds: Math.max(1.0, Math.min(1000000, ticket.effectiveCombinedOdds)),
-      shareCode: clampString(ticket.shareCode || '', 32),
-      shareUrl: clampString(ticket.shareUrl || '', 300),
-      shareCodeVerified: Boolean(ticket.shareCodeVerified),
-      bookingCodeStatus: ticket.bookingCodeStatus || 'NOT_REQUESTED',
-      bookingCodeError: clampString(ticket.bookingCodeError || '', 300),
-      selectionSettlements: ticket.selectionSettlements.slice(0, 30),
-      settledAt: clampString(ticket.settledAt || '', 40),
-      updatedAt: serverTimestamp(),
-    };
+          const ticketPayload: Record<string, unknown> = {
+            isPublic: true,
+            publishedByUid: adminUid,
+            internalTicketId: safeId,
+            signature: clampString(ticket.signature, 160, safeId),
+            bookmakerId: bkId,
+            feedSection,
+            sourceType: ticket.sourceType === 'ADMIN_MANUAL' ? 'ADMIN_MANUAL' : 'DAILY_FACTORY',
+            categoryId: clampString(ticket.categoryId, 40, 'cat_2_3'),
+            categoryLabel: clampString(ticket.categoryLabel, 60, '2.00-3.00'),
+            targetOdds: toFiniteBounded(ticket.targetOdds, 1.01, 100000, 1.01),
+            actualCombinedOdds: toFiniteBounded(ticket.actualCombinedOdds, 1.01, 1000000, 1.01),
+            selectionCount: Math.max(
+              1,
+              Math.min(30, Math.round(toFiniteBounded(ticket.selectionCount, 1, 30, cleanSelections.length)))
+            ),
+            kickoffStartMs,
+            kickoffEndMs,
+            dataSource: clampString(
+              ticket.dataSource,
+              120,
+              bkId === 'BETPAWA_TZ' ? 'betPawa TZ' : 'SportyBet TZ'
+            ),
+            generatedDateKey: clampString(ticket.generatedDateKey, 20, '2026-01-01'),
+            originalSelections: cleanSelections,
+            createdAt: serverTimestamp(),
+          };
 
-    if (!existingUpdate.exists()) {
-      await setDoc(updateRef, {
-        isPublic: true,
-        internalTicketId: safeId,
-        ...mutableFields,
-        createdAt: serverTimestamp(),
-      });
-    } else {
-      const prevStatus = String(existingUpdate.data()?.status || '');
-      if (prevStatus !== 'WON' && prevStatus !== 'LOST' && prevStatus !== 'VOID') {
-        await updateDoc(updateRef, mutableFields);
+          if (cleanCycleId) ticketPayload.cycleId = cleanCycleId;
+          if (cleanIdempotencyKey) ticketPayload.idempotencyKey = cleanIdempotencyKey;
+          if (cleanSportId) ticketPayload.sportId = cleanSportId;
+          if (cleanSportName) ticketPayload.sportName = cleanSportName;
+          if (cleanReplacedId) ticketPayload.replacedTicketId = cleanReplacedId;
+
+          try {
+            await setDoc(ticketRef, ticketPayload);
+          } catch (writeErr) {
+            // If another concurrent admin session created the immutable ticket first, setDoc is treated as an update and denied;
+            // verify existence before treating it as a failure.
+            const recheck = await getDoc(ticketRef).catch(() => null);
+            if (!recheck || !recheck.exists()) {
+              throw writeErr;
+            }
+          }
+        }
+
+        currentPath = `publicTicketUpdates/${safeId}`;
+        currentOp = OperationType.GET;
+        const existingUpdate = await getDoc(updateRef);
+        const mutableFields = {
+          bookmakerId: bkId,
+          cycleId: clampString(ticket.cycleId || '', 80),
+          status: ticket.status,
+          effectiveCombinedOdds: toFiniteBounded(
+            ticket.effectiveCombinedOdds ?? ticket.actualCombinedOdds,
+            1.0,
+            1000000,
+            1.0
+          ),
+          settledMatchCount,
+          totalMatchCount,
+          unfinishedMatchCount,
+          shareCode: clampString(ticket.shareCode || '', 32),
+          shareUrl: clampString(ticket.shareUrl || '', 300),
+          shareCodeVerified: Boolean(ticket.shareCodeVerified),
+          bookingCodeStatus: ticket.bookingCodeStatus || 'NOT_REQUESTED',
+          bookingCodeError: clampString(ticket.bookingCodeError || '', 300),
+          selectionSettlements: cleanSettlements,
+          settledAt: clampString(ticket.settledAt || '', 40),
+          updatedAt: serverTimestamp(),
+        };
+
+        if (!existingUpdate.exists()) {
+          currentOp = OperationType.CREATE;
+          await setDoc(updateRef, {
+            isPublic: true,
+            internalTicketId: safeId,
+            ...mutableFields,
+            createdAt: serverTimestamp(),
+          });
+        } else {
+          currentOp = OperationType.UPDATE;
+          const prevData = existingUpdate.data() || {};
+          const prevStatus = String(prevData.status || '');
+          const prevUnfinished = Number(prevData.unfinishedMatchCount ?? 0);
+          if (prevStatus !== 'WON' && prevStatus !== 'LOST' && prevStatus !== 'VOID') {
+            await updateDoc(updateRef, mutableFields);
+          } else if (prevStatus === 'LOST' && prevUnfinished > 0 && unfinishedMatchCount < prevUnfinished) {
+            await updateDoc(updateRef, {
+              selectionSettlements: cleanSettlements,
+              settledMatchCount,
+              totalMatchCount,
+              unfinishedMatchCount,
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+      } catch (err) {
+        handleFirestoreError(err, currentOp, currentPath);
       }
+    });
+
+  inFlightTicketSyncs.set(safeId, run);
+  try {
+    await run;
+  } finally {
+    if (inFlightTicketSyncs.get(safeId) === run) {
+      inFlightTicketSyncs.delete(safeId);
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, path);
   }
 }
 
@@ -828,21 +960,30 @@ export async function saveAdminSettingsRecord(
 }
 
 export async function savePublicStatsRecord(stats: {
+  statDocId?: string;
+  bookmakerId?: BookmakerId;
+  activeCycleId?: string | null;
+  generationLocked?: boolean;
+  lockStatus?: FeedLockStatus;
+  lockReason?: string;
   dailyTicketTarget: number;
   totalGeneratedToday: number;
   bookingCodesGeneratedToday: number;
   liveFootballCount?: number;
   otherSportsCount?: number;
   upcomingActiveCount?: number;
+  unfinishedMatchesCount?: number;
+  unsettledTicketsCount?: number;
   settledWonCount?: number;
   settledLostCount?: number;
   settledVoidCount?: number;
   lastScanningAt: string | null;
   lastSettlementAt: string | null;
 }): Promise<void> {
-  const path = 'publicStats/daily';
+  const docId = clampString(stats.statDocId || 'daily', 80, 'daily');
+  const path = `publicStats/${docId}`;
   try {
-    await setDoc(doc(db, 'publicStats', 'daily'), {
+    const payload: Record<string, unknown> = {
       isPublic: true,
       dailyTicketTarget: Math.max(1, Math.min(200, Math.round(stats.dailyTicketTarget))),
       totalGeneratedToday: Math.max(0, Math.min(1000, Math.round(stats.totalGeneratedToday))),
@@ -853,15 +994,137 @@ export async function savePublicStatsRecord(stats: {
       liveFootballCount: Math.max(0, Math.min(500, Math.round(stats.liveFootballCount ?? 0))),
       otherSportsCount: Math.max(0, Math.min(500, Math.round(stats.otherSportsCount ?? 0))),
       upcomingActiveCount: Math.max(0, Math.min(500, Math.round(stats.upcomingActiveCount ?? 0))),
+      unfinishedMatchesCount: Math.max(
+        0,
+        Math.min(5000, Math.round(stats.unfinishedMatchesCount ?? 0))
+      ),
+      unsettledTicketsCount: Math.max(
+        0,
+        Math.min(5000, Math.round(stats.unsettledTicketsCount ?? 0))
+      ),
       settledWonCount: Math.max(0, Math.min(5000, Math.round(stats.settledWonCount ?? 0))),
       settledLostCount: Math.max(0, Math.min(5000, Math.round(stats.settledLostCount ?? 0))),
       settledVoidCount: Math.max(0, Math.min(5000, Math.round(stats.settledVoidCount ?? 0))),
       lastScanningAt: clampString(stats.lastScanningAt || '', 40),
       lastSettlementAt: clampString(stats.lastSettlementAt || '', 40),
       updatedAt: serverTimestamp(),
+    };
+    if (stats.bookmakerId) payload.bookmakerId = stats.bookmakerId;
+    if (stats.activeCycleId !== undefined) {
+      payload.activeCycleId = clampString(stats.activeCycleId || '', 80);
+    }
+    if (typeof stats.generationLocked === 'boolean') {
+      payload.generationLocked = stats.generationLocked;
+    }
+    if (stats.lockStatus) payload.lockStatus = stats.lockStatus;
+    if (stats.lockReason !== undefined) {
+      payload.lockReason = clampString(stats.lockReason || '', 300);
+    }
+    await setDoc(doc(db, 'publicStats', docId), payload);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function syncBookmakerFeedState(state: BookmakerFeedState): Promise<void> {
+  const path = `bookmakerFeedStates/${state.bookmakerId}`;
+  try {
+    await setDoc(doc(db, 'bookmakerFeedStates', state.bookmakerId), {
+      isPublic: true,
+      bookmakerId: state.bookmakerId,
+      bookmakerName: clampString(state.bookmakerName, 80, state.bookmakerId),
+      activeCycleId: clampString(state.activeCycleId || '', 80),
+      generationLocked: Boolean(state.generationLocked),
+      lockStatus: state.lockStatus === 'LOCKED' ? 'LOCKED' : 'UNLOCKED',
+      lockReason: clampString(state.lockReason || '', 300),
+      totalTicketsInCycle: Math.max(0, Math.min(1000, Math.round(state.totalTicketsInCycle))),
+      settledTicketsInCycle: Math.max(0, Math.min(1000, Math.round(state.settledTicketsInCycle))),
+      unsettledTicketsCount: Math.max(0, Math.min(1000, Math.round(state.unsettledTicketsCount))),
+      totalMatchesInCycle: Math.max(0, Math.min(10000, Math.round(state.totalMatchesInCycle))),
+      finishedMatchesCount: Math.max(0, Math.min(10000, Math.round(state.finishedMatchesCount))),
+      unfinishedMatchesCount: Math.max(
+        0,
+        Math.min(10000, Math.round(state.unfinishedMatchesCount))
+      ),
+      unverifiedMatchesCount: Math.max(
+        0,
+        Math.min(10000, Math.round(state.unverifiedMatchesCount))
+      ),
+      verificationFailuresCount: Math.max(
+        0,
+        Math.min(10000, Math.round(state.verificationFailuresCount))
+      ),
+      lastGenerationAt: clampString(state.lastGenerationAt || '', 40),
+      lastResultCheckAt: clampString(state.lastResultCheckAt || '', 40),
+      lastUnlockedAt: clampString(state.lastUnlockedAt || '', 40),
+      updatedAt: serverTimestamp(),
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function syncFeedCycleRecord(cycle: GenerationCycle): Promise<void> {
+  const safeId = clampString(cycle.cycleId, 80).replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!safeId) return;
+
+  const prevInFlight = inFlightCycleSyncs.get(safeId) || Promise.resolve();
+  const run = prevInFlight
+    .catch(() => {})
+    .then(async () => {
+      const path = `feedCycles/${safeId}`;
+      const ref = doc(db, 'feedCycles', safeId);
+      let currentOp = OperationType.GET;
+      try {
+        const snap = await getDoc(ref);
+        if (!snap.exists()) {
+          currentOp = OperationType.CREATE;
+          await setDoc(ref, {
+            isPublic: true,
+            cycleId: safeId,
+            idempotencyKey: clampString(cycle.idempotencyKey, 160, safeId),
+            bookmakerId: cycle.bookmakerId === 'BETPAWA_TZ' ? 'BETPAWA_TZ' : 'SPORTYBET_TZ',
+            dateKey: clampString(cycle.dateKey, 20, '2026-01-01'),
+            status: cycle.status === 'SETTLED' ? 'SETTLED' : 'ACTIVE',
+            generationLocked: Boolean(cycle.generationLocked),
+            ticketIds: (cycle.ticketIds || []).slice(0, 200),
+            ticketCount: Math.round(toFiniteBounded(cycle.ticketCount, 0, 500, 0)),
+            totalMatches: Math.round(toFiniteBounded(cycle.totalMatches, 0, 10000, 0)),
+            finishedMatches: Math.round(toFiniteBounded(cycle.finishedMatches, 0, 10000, 0)),
+            unfinishedMatches: Math.round(toFiniteBounded(cycle.unfinishedMatches, 0, 10000, 0)),
+            wonTickets: Math.round(toFiniteBounded(cycle.wonTickets, 0, 500, 0)),
+            lostTickets: Math.round(toFiniteBounded(cycle.lostTickets, 0, 500, 0)),
+            voidTickets: Math.round(toFiniteBounded(cycle.voidTickets, 0, 500, 0)),
+            settledAt: clampString(cycle.settledAt || '', 40),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } else if (String(snap.data()?.status || '') !== 'SETTLED') {
+          currentOp = OperationType.UPDATE;
+          await updateDoc(ref, {
+            status: cycle.status === 'SETTLED' ? 'SETTLED' : 'ACTIVE',
+            generationLocked: Boolean(cycle.generationLocked),
+            finishedMatches: Math.round(toFiniteBounded(cycle.finishedMatches, 0, 10000, 0)),
+            unfinishedMatches: Math.round(toFiniteBounded(cycle.unfinishedMatches, 0, 10000, 0)),
+            wonTickets: Math.round(toFiniteBounded(cycle.wonTickets, 0, 500, 0)),
+            lostTickets: Math.round(toFiniteBounded(cycle.lostTickets, 0, 500, 0)),
+            voidTickets: Math.round(toFiniteBounded(cycle.voidTickets, 0, 500, 0)),
+            settledAt: clampString(cycle.settledAt || '', 40),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch (err) {
+        handleFirestoreError(err, currentOp, path);
+      }
+    });
+
+  inFlightCycleSyncs.set(safeId, run);
+  try {
+    await run;
+  } finally {
+    if (inFlightCycleSyncs.get(safeId) === run) {
+      inFlightCycleSyncs.delete(safeId);
+    }
   }
 }
 
@@ -919,6 +1182,15 @@ export function mapPublicDocsToGeneratedTickets(
     const status = (upd?.status as TicketStatus) || 'PENDING';
     const actualCombinedOdds = Number(docItem.actualCombinedOdds || 1);
     const targetOdds = Number(docItem.targetOdds || actualCombinedOdds);
+    const selections = (docItem.originalSelections || []) as unknown as TicketSelectionRecord[];
+    const selectionSettlements = (upd?.selectionSettlements || []) as unknown as SelectionSettlementRecord[];
+    const totalMatchCount = Number(upd?.totalMatchCount ?? selections.length);
+    const settledMatchCount = Number(
+      upd?.settledMatchCount ??
+        selectionSettlements.filter(
+          (s) => s.status === 'WON' || s.status === 'LOST' || s.status === 'VOID'
+        ).length
+    );
 
     return {
       internalTicketId: ticketId,
@@ -926,6 +1198,8 @@ export function mapPublicDocsToGeneratedTickets(
       bookmakerName: bkId === 'BETPAWA_TZ' ? 'betPawa Tanzania' : 'SportyBet Tanzania',
       bookmakerUrl:
         bkId === 'BETPAWA_TZ' ? 'https://www.betpawa.co.tz/bets' : 'https://www.sportybet.com/tz/m/',
+      cycleId: docItem.cycleId || upd?.cycleId || undefined,
+      idempotencyKey: docItem.idempotencyKey || undefined,
       feedSection: docItem.feedSection || 'UPCOMING',
       sportId: docItem.sportId,
       sportName: docItem.sportName,
@@ -937,8 +1211,8 @@ export function mapPublicDocsToGeneratedTickets(
       targetOdds,
       actualCombinedOdds,
       oddsDifference: Number(Math.abs(targetOdds - actualCombinedOdds).toFixed(3)),
-      selectionCount: Number(docItem.selectionCount || docItem.originalSelections?.length || 0),
-      selections: (docItem.originalSelections || []) as unknown as TicketSelectionRecord[],
+      selectionCount: Number(docItem.selectionCount || selections.length || 0),
+      selections,
       kickoffStartMs: Number(docItem.kickoffStartMs || 0),
       kickoffEndMs: Number(docItem.kickoffEndMs || docItem.kickoffStartMs || 0),
       dataSource: docItem.dataSource || 'SportyBet TZ',
@@ -948,7 +1222,12 @@ export function mapPublicDocsToGeneratedTickets(
       revalidatedAt: createdAtIso,
       status,
       effectiveCombinedOdds: Number(upd?.effectiveCombinedOdds ?? actualCombinedOdds),
-      selectionSettlements: (upd?.selectionSettlements || []) as unknown as SelectionSettlementRecord[],
+      settledMatchCount,
+      totalMatchCount,
+      unfinishedMatchCount: Number(
+        upd?.unfinishedMatchCount ?? Math.max(0, totalMatchCount - settledMatchCount)
+      ),
+      selectionSettlements,
       shareCode: upd?.shareCode ? upd.shareCode : null,
       shareUrl: upd?.shareUrl ? upd.shareUrl : null,
       shareCodeDeadline: null,

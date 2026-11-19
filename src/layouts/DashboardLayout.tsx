@@ -79,7 +79,7 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
     activeSection,
     setActiveSection,
     betslip,
-    portfolioTickets,
+    activeBookmakerTickets,
     loadingPortfolio,
     refreshPortfolio,
     unreadCount,
@@ -209,9 +209,9 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
                     <Icon className="w-4 h-4 shrink-0" />
                     <span className="truncate">{item.label}</span>
                   </span>
-                  {item.id === 'feed' && portfolioTickets.length > 0 && (
+                  {item.id === 'feed' && activeBookmakerTickets.length > 0 && (
                     <span className="font-mono text-xs tabular-nums text-emerald-600 dark:text-emerald-400">
-                      {portfolioTickets.length}
+                      {activeBookmakerTickets.length}
                     </span>
                   )}
                   {item.id === 'favorites' && favoriteTickets.length > 0 && (

@@ -649,6 +649,9 @@ export function generateDailyPortfolioFromMatches(params: {
   matches: NormalizedMatch[];
   config: DailyFactoryConfig;
   targetCount: number;
+  bookmakerId?: BookmakerId;
+  cycleId?: string;
+  idempotencyKey?: string;
   sourceType?: 'DAILY_FACTORY' | 'ADMIN_MANUAL';
   feedSection?: FeedSection;
   allowLive?: boolean;
@@ -673,11 +676,15 @@ export function generateDailyPortfolioFromMatches(params: {
   const existingSignatures = new Set(params.existingSignatures || []);
 
   const activeBookmaker = normalizeBookmakerId(
-    matches[0]?.bookmakerId || config.activeBookmaker
+    params.bookmakerId || matches[0]?.bookmakerId || config.activeBookmaker
   );
   const bookmakerInfo = getBookmakerInfo(activeBookmaker);
+  const scopedConfig: DailyFactoryConfig = {
+    ...config,
+    activeBookmaker,
+  };
 
-  const candidates = discoverEligibleSelections(matches, config, nowMs, {
+  const candidates = discoverEligibleSelections(matches, scopedConfig, nowMs, {
     allowLive: params.allowLive,
     allowBothLiveAndUpcoming: params.allowBothLiveAndUpcoming,
     ignoreScheduleWindow: params.ignoreScheduleWindow,
@@ -796,6 +803,8 @@ export function generateDailyPortfolioFromMatches(params: {
       bookmakerId: activeBookmaker,
       bookmakerName: bookmakerInfo.name,
       bookmakerUrl: bookmakerInfo.websiteUrl,
+      cycleId: params.cycleId,
+      idempotencyKey: params.idempotencyKey,
       feedSection,
       sportId: ticketSportId,
       sportName: ticketSportName,
@@ -817,16 +826,19 @@ export function generateDailyPortfolioFromMatches(params: {
       revalidatedAt: generatedAt,
       status: picks.some((p) => p.isLive) ? 'LIVE' : 'PENDING',
       effectiveCombinedOdds: actualCombinedOdds,
+      settledMatchCount: 0,
+      totalMatchCount: picks.length,
+      unfinishedMatchCount: picks.length,
       selectionSettlements: picks.map((p) => ({
         selectionKey: p.selectionKey,
         eventId: p.eventId,
-        status: p.isLive ? 'LIVE' : 'PENDING',
+        status: p.isLive ? 'LIVE' : 'UPCOMING',
         officialMatchStatus: p.matchStatus,
         score: null,
         playedSeconds: null,
         currentOdds: p.odds,
         oddsChanged: false,
-        reason: p.isLive ? 'Live In-Play selection' : 'Awaiting kickoff',
+        reason: p.isLive ? 'Live In-Play selection' : 'Scheduled upcoming kickoff',
         checkedAt: generatedAt,
       })),
       shareCode: null,
@@ -925,9 +937,10 @@ export function generateDailyPortfolioFromMatches(params: {
 }
 
 export async function fetchUpcomingMatchesForFactory(
-  config: DailyFactoryConfig
+  config: DailyFactoryConfig,
+  bookmakerIdOverride?: BookmakerId
 ): Promise<NormalizedMatch[]> {
-  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+  const bookmakerId = normalizeBookmakerId(bookmakerIdOverride || config.activeBookmaker);
   const client = getBookmakerClient(bookmakerId);
   const allCatalogMarkets = getBookmakerMarketCatalog(bookmakerId)
     .filter((m) => !isDisallowedDailyFeedMarket(m.id, m.name))
@@ -977,9 +990,10 @@ export async function fetchUpcomingMatchesForFactory(
 }
 
 export async function fetchLiveFootballMatchesForFactory(
-  config: DailyFactoryConfig
+  config: DailyFactoryConfig,
+  bookmakerIdOverride?: BookmakerId
 ): Promise<NormalizedMatch[]> {
-  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+  const bookmakerId = normalizeBookmakerId(bookmakerIdOverride || config.activeBookmaker);
   const client = getBookmakerClient(bookmakerId);
 
   const summaryLive = await client.getLiveMatches('sr:sport:1').catch(() => []);
@@ -1017,9 +1031,10 @@ export async function fetchLiveFootballMatchesForFactory(
 }
 
 export async function fetchOtherSportsMatchesForFactory(
-  config: DailyFactoryConfig
+  config: DailyFactoryConfig,
+  bookmakerIdOverride?: BookmakerId
 ): Promise<NormalizedMatch[]> {
-  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+  const bookmakerId = normalizeBookmakerId(bookmakerIdOverride || config.activeBookmaker);
   const client = getBookmakerClient(bookmakerId);
   if (bookmakerId === 'BETPAWA_TZ') {
     return [];

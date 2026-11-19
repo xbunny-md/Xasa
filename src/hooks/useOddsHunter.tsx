@@ -22,9 +22,14 @@ import {
   saveNotificationRecord,
   savePublicStatsRecord,
   saveScanHistoryRecord,
+  syncBookmakerFeedState,
+  syncFeedCycleRecord,
   syncPublicTicketBundle,
   updateUserPreferences,
   type AppNotificationRecord,
+  type BookmakerFeedStateDocRecord,
+  type FeedCycleDocRecord,
+  type MatchResultDocRecord,
   type PublicStatsDocRecord,
   type PublicTicketDocRecord,
   type PublicTicketUpdateDocRecord,
@@ -40,19 +45,24 @@ import type {
   BetslipSelection,
   BetslipValidationResponse,
   BookmakerCatalogInfo,
+  BookmakerFeedState,
   BookmakerId,
   BookingCodeResponse,
+  CycleUnfinishedMatchInfo,
   DailyFactoryConfig,
   DiagnosticCheck,
   GeneratedTicket,
+  GenerationCycle,
   LeagueDirectoryItem,
   MarketCatalogItem,
+  MatchResultRecord,
   NormalizedMatch,
   OddsCategoryConfig,
   PerformanceAnalyticsSummary,
   PlatformSettings,
   QualifyingSelection,
   ResearchReport,
+  ResultVerificationFailure,
   ScannerConfig,
   ScanResult,
   SchedulerStatus,
@@ -237,6 +247,44 @@ function isTerminalStatus(status: GeneratedTicket['status']): boolean {
   return status === 'WON' || status === 'LOST' || status === 'VOID';
 }
 
+function isSelectionTerminal(status: string): boolean {
+  return status === 'WON' || status === 'LOST' || status === 'VOID';
+}
+
+function defaultBookmakerFeedState(bookmakerId: BookmakerId): BookmakerFeedState {
+  const info =
+    DEFAULT_BOOKMAKER_LIST.find((b) => b.id === bookmakerId) || DEFAULT_BOOKMAKER_LIST[0];
+  return {
+    bookmakerId,
+    bookmakerName: info.name,
+    activeCycleId: null,
+    generationLocked: false,
+    lockStatus: 'UNLOCKED',
+    lockReason: 'No active cycle yet — unlocked for initial permanent feed generation.',
+    totalTicketsInCycle: 0,
+    settledTicketsInCycle: 0,
+    unsettledTicketsCount: 0,
+    totalMatchesInCycle: 0,
+    finishedMatchesCount: 0,
+    unfinishedMatchesCount: 0,
+    unverifiedMatchesCount: 0,
+    verificationFailuresCount: 0,
+    lastGenerationAt: null,
+    lastResultCheckAt: null,
+    lastUnlockedAt: null,
+    updatedAt: new Date(0).toISOString(),
+  };
+}
+
+function timestampValToIso(val: unknown, fallback = ''): string {
+  if (!val) return fallback;
+  if (typeof val === 'string') return val;
+  if (typeof (val as { toDate?: () => Date }).toDate === 'function') {
+    return (val as { toDate: () => Date }).toDate().toISOString();
+  }
+  return fallback;
+}
+
 function mergeImmutableFeeds(
   firebaseTickets: GeneratedTicket[],
   apiTickets: GeneratedTicket[]
@@ -254,8 +302,31 @@ function mergeImmutableFeeds(
       continue;
     }
 
-    // Never mutate or overwrite immutable ticket core selections/category/odds or locked terminal outcomes
-    if (isTerminalStatus(existing.status)) {
+    // WON and VOID outcomes are permanently locked
+    if (existing.status === 'WON' || existing.status === 'VOID') {
+      continue;
+    }
+
+    // LOST tickets preserve terminal LOST status & odds, while permitting unfinished legs in that ticket to settle
+    if (existing.status === 'LOST') {
+      const existingSettledCount = existing.selectionSettlements.filter((s) =>
+        isSelectionTerminal(s.status)
+      ).length;
+      const apiSettledCount = api.selectionSettlements.filter((s) =>
+        isSelectionTerminal(s.status)
+      ).length;
+      if (apiSettledCount > existingSettledCount) {
+        merged.set(api.internalTicketId, {
+          ...existing,
+          selectionSettlements: api.selectionSettlements,
+          settledMatchCount: api.settledMatchCount ?? apiSettledCount,
+          totalMatchCount: api.totalMatchCount ?? existing.selections.length,
+          unfinishedMatchCount:
+            api.unfinishedMatchCount ??
+            Math.max(0, existing.selections.length - apiSettledCount),
+          lastCheckedAt: api.lastCheckedAt || existing.lastCheckedAt,
+        });
+      }
       continue;
     }
 
@@ -263,6 +334,7 @@ function mergeImmutableFeeds(
       isTerminalStatus(api.status) ||
       (Boolean(api.shareCode) && !existing.shareCode) ||
       api.status !== existing.status ||
+      (api.settledMatchCount ?? 0) !== (existing.settledMatchCount ?? 0) ||
       api.selectionSettlements.length > existing.selectionSettlements.length;
 
     if (shouldTakeMutableUpdate) {
@@ -270,6 +342,9 @@ function mergeImmutableFeeds(
         ...existing,
         status: api.status,
         effectiveCombinedOdds: api.effectiveCombinedOdds,
+        settledMatchCount: api.settledMatchCount ?? existing.settledMatchCount,
+        totalMatchCount: api.totalMatchCount ?? existing.totalMatchCount,
+        unfinishedMatchCount: api.unfinishedMatchCount ?? existing.unfinishedMatchCount,
         shareCode: api.shareCode || existing.shareCode,
         shareUrl: api.shareUrl || existing.shareUrl,
         shareCodeVerified: api.shareCodeVerified || existing.shareCodeVerified,
@@ -387,6 +462,7 @@ interface OddsHunterContextValue {
 
   // Public Daily Feed, Favorites & Admin Daily Factory Controls
   portfolioTickets: GeneratedTicket[];
+  activeBookmakerTickets: GeneratedTicket[];
   loadingPortfolio: boolean;
   refreshPortfolio: () => Promise<void>;
   isTicketFavorited: (internalTicketId: string) => boolean;
@@ -395,6 +471,13 @@ interface OddsHunterContextValue {
   refreshAnalytics: () => Promise<void>;
   schedulerStatus: SchedulerStatus | null;
   refreshScheduler: () => Promise<void>;
+  feedStates: Record<BookmakerId, BookmakerFeedState>;
+  activeFeedState: BookmakerFeedState;
+  feedCycles: GenerationCycle[];
+  activeCycle: GenerationCycle | null;
+  unfinishedMatches: CycleUnfinishedMatchInfo[];
+  verificationFailures: ResultVerificationFailure[];
+  matchResults: MatchResultRecord[];
 
   // Admin-Only State & Controls
   factoryConfig: DailyFactoryConfig;
@@ -404,14 +487,16 @@ interface OddsHunterContextValue {
   runningFactory: boolean;
   trackingResults: boolean;
   retryingCodes: boolean;
+  retryingResults: boolean;
   loadAdminFactoryState: () => Promise<void>;
   saveFactoryConfig: (cfg: DailyFactoryConfig) => Promise<void>;
   toggleAutomation: (mode: 'start' | 'stop' | 'pause' | 'resume') => Promise<void>;
-  runFactoryNow: () => Promise<void>;
+  runFactoryNow: (bookmaker?: BookmakerId) => Promise<void>;
   deletePortfolioTicket: (internalTicketId: string) => Promise<void>;
   createBookingCodeForTicket: (internalTicketId: string) => Promise<GeneratedTicket | null>;
   retryFailedBookingCodes: (ticketIds?: string[]) => Promise<void>;
-  trackAllResultsNow: (ticketIds?: string[]) => Promise<void>;
+  trackAllResultsNow: (ticketIds?: string[], bookmaker?: BookmakerId) => Promise<void>;
+  retryFailedResultChecks: (bookmaker?: BookmakerId) => Promise<void>;
 }
 
 const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
@@ -509,8 +594,16 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
   const [firebaseTicketDocs, setFirebaseTicketDocs] = useState<PublicTicketDocRecord[]>([]);
   const [firebaseUpdateDocs, setFirebaseUpdateDocs] = useState<PublicTicketUpdateDocRecord[]>([]);
   const [firebasePublicStats, setFirebasePublicStats] = useState<PublicStatsDocRecord | null>(null);
+  const [firebaseFeedStateDocs, setFirebaseFeedStateDocs] = useState<BookmakerFeedStateDocRecord[]>([]);
+  const [firebaseFeedCycleDocs, setFirebaseFeedCycleDocs] = useState<FeedCycleDocRecord[]>([]);
+  const [firebaseMatchResultDocs, setFirebaseMatchResultDocs] = useState<MatchResultDocRecord[]>([]);
   const [firebaseFeedLoaded, setFirebaseFeedLoaded] = useState(false);
   const [apiTickets, setApiTickets] = useState<GeneratedTicket[]>([]);
+  const [apiFeedStates, setApiFeedStates] = useState<Record<BookmakerId, BookmakerFeedState> | null>(null);
+  const [apiFeedCycles, setApiFeedCycles] = useState<GenerationCycle[]>([]);
+  const [apiUnfinishedMatches, setApiUnfinishedMatches] = useState<CycleUnfinishedMatchInfo[]>([]);
+  const [apiVerificationFailures, setApiVerificationFailures] = useState<ResultVerificationFailure[]>([]);
+  const [apiMatchResults, setApiMatchResults] = useState<MatchResultRecord[]>([]);
   const [apiLoaded, setApiLoaded] = useState(false);
   const [analyticsSummaryRaw, setAnalyticsSummary] = useState<PerformanceAnalyticsSummary | null>(
     null
@@ -529,10 +622,200 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     [firebaseTickets, apiTickets]
   );
 
+  const activeBookmakerTickets = useMemo(
+    () =>
+      portfolioTickets.filter(
+        (t) => (t.bookmakerId || 'SPORTYBET_TZ') === activeBookmaker
+      ),
+    [portfolioTickets, activeBookmaker]
+  );
+
+  const feedStates = useMemo<Record<BookmakerId, BookmakerFeedState>>(() => {
+    const out: Record<BookmakerId, BookmakerFeedState> = {
+      SPORTYBET_TZ: defaultBookmakerFeedState('SPORTYBET_TZ'),
+      BETPAWA_TZ: defaultBookmakerFeedState('BETPAWA_TZ'),
+    };
+
+    for (const bk of ['SPORTYBET_TZ', 'BETPAWA_TZ'] as BookmakerId[]) {
+      const fbDoc = firebaseFeedStateDocs.find((d) => d.bookmakerId === bk || d.id === bk);
+      const apiSt = apiFeedStates?.[bk] || schedulerStatusRaw?.byBookmaker?.[bk];
+
+      const bkTickets = portfolioTickets.filter((t) => (t.bookmakerId || 'SPORTYBET_TZ') === bk);
+      const fbMapped: BookmakerFeedState | null = fbDoc
+        ? {
+            bookmakerId: bk,
+            bookmakerName: fbDoc.bookmakerName || out[bk].bookmakerName,
+            activeCycleId: fbDoc.activeCycleId || null,
+            generationLocked: Boolean(fbDoc.generationLocked),
+            lockStatus: fbDoc.lockStatus === 'LOCKED' ? 'LOCKED' : 'UNLOCKED',
+            lockReason: fbDoc.lockReason || out[bk].lockReason,
+            totalTicketsInCycle: Number(fbDoc.totalTicketsInCycle || 0),
+            settledTicketsInCycle: Number(fbDoc.settledTicketsInCycle || 0),
+            unsettledTicketsCount: Number(fbDoc.unsettledTicketsCount || 0),
+            totalMatchesInCycle: Number(fbDoc.totalMatchesInCycle || 0),
+            finishedMatchesCount: Number(fbDoc.finishedMatchesCount || 0),
+            unfinishedMatchesCount: Number(fbDoc.unfinishedMatchesCount || 0),
+            unverifiedMatchesCount: Number(fbDoc.unverifiedMatchesCount || 0),
+            verificationFailuresCount: Number(fbDoc.verificationFailuresCount || 0),
+            lastGenerationAt: fbDoc.lastGenerationAt || null,
+            lastResultCheckAt: fbDoc.lastResultCheckAt || null,
+            lastUnlockedAt: fbDoc.lastUnlockedAt || null,
+            updatedAt: timestampValToIso(fbDoc.updatedAt, out[bk].updatedAt),
+          }
+        : null;
+
+      if (apiSt && (!fbMapped || Date.parse(apiSt.updatedAt || '') >= Date.parse(fbMapped.updatedAt || ''))) {
+        out[bk] = apiSt;
+      } else if (fbMapped) {
+        out[bk] = fbMapped;
+      } else if (bkTickets.length > 0) {
+        // Derive cycle lock conservatively from tickets on client if feedState doc not yet created
+        const latestCycleId = bkTickets[0]?.cycleId || null;
+        const cycleScope = latestCycleId
+          ? bkTickets.filter((t) => t.cycleId === latestCycleId)
+          : bkTickets;
+        let unfinished = 0;
+        let finished = 0;
+        let total = 0;
+        let unsettled = 0;
+        for (const t of cycleScope) {
+          let legUnfinished = false;
+          for (const sel of t.selections) {
+            total++;
+            const st = t.selectionSettlements.find((s) => s.selectionKey === sel.selectionKey);
+            if (st && isSelectionTerminal(st.status)) {
+              finished++;
+            } else {
+              unfinished++;
+              legUnfinished = true;
+            }
+          }
+          if (!isTerminalStatus(t.status) || legUnfinished) unsettled++;
+        }
+        const locked = unfinished > 0 || unsettled > 0;
+        out[bk] = {
+          ...out[bk],
+          activeCycleId: latestCycleId,
+          generationLocked: locked,
+          lockStatus: locked ? 'LOCKED' : 'UNLOCKED',
+          lockReason: locked
+            ? `LOCKED: Waiting for ${unfinished} unfinished match selection(s) before new generation.`
+            : 'All matches settled — unlocked for next cycle.',
+          totalTicketsInCycle: cycleScope.length,
+          settledTicketsInCycle: cycleScope.length - unsettled,
+          unsettledTicketsCount: unsettled,
+          totalMatchesInCycle: total,
+          finishedMatchesCount: finished,
+          unfinishedMatchesCount: unfinished,
+        };
+      }
+    }
+
+    return out;
+  }, [firebaseFeedStateDocs, apiFeedStates, schedulerStatusRaw?.byBookmaker, portfolioTickets]);
+
+  const feedCycles = useMemo<GenerationCycle[]>(() => {
+    const map = new Map<string, GenerationCycle>();
+    for (const d of firebaseFeedCycleDocs) {
+      const cyc: GenerationCycle = {
+        cycleId: d.cycleId || d.id,
+        idempotencyKey: d.idempotencyKey || d.cycleId || d.id,
+        bookmakerId: d.bookmakerId === 'BETPAWA_TZ' ? 'BETPAWA_TZ' : 'SPORTYBET_TZ',
+        dateKey: d.dateKey || '2026-01-01',
+        status: d.status === 'SETTLED' ? 'SETTLED' : 'ACTIVE',
+        generationLocked: Boolean(d.generationLocked),
+        ticketIds: Array.isArray(d.ticketIds) ? d.ticketIds : [],
+        ticketCount: Number(d.ticketCount || 0),
+        totalMatches: Number(d.totalMatches || 0),
+        finishedMatches: Number(d.finishedMatches || 0),
+        unfinishedMatches: Number(d.unfinishedMatches || 0),
+        wonTickets: Number(d.wonTickets || 0),
+        lostTickets: Number(d.lostTickets || 0),
+        voidTickets: Number(d.voidTickets || 0),
+        createdAt: timestampValToIso(d.createdAt, new Date(0).toISOString()),
+        updatedAt: timestampValToIso(d.updatedAt, new Date(0).toISOString()),
+        settledAt: d.settledAt || null,
+      };
+      map.set(cyc.cycleId, cyc);
+    }
+    for (const c of apiFeedCycles) {
+      const prev = map.get(c.cycleId);
+      if (!prev || prev.status !== 'SETTLED' || c.status === 'SETTLED') {
+        map.set(c.cycleId, c);
+      }
+    }
+    return Array.from(map.values()).sort(
+      (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
+    );
+  }, [firebaseFeedCycleDocs, apiFeedCycles]);
+
+  const activeFeedState = feedStates[activeBookmaker];
+
+  const activeCycle = useMemo<GenerationCycle | null>(() => {
+    const bkCycles = feedCycles.filter((c) => c.bookmakerId === activeBookmaker);
+    if (activeFeedState.activeCycleId) {
+      const found = bkCycles.find((c) => c.cycleId === activeFeedState.activeCycleId);
+      if (found) return found;
+    }
+    return bkCycles.find((c) => c.status === 'ACTIVE') || bkCycles[0] || null;
+  }, [feedCycles, activeBookmaker, activeFeedState.activeCycleId]);
+
+  const unfinishedMatches = useMemo<CycleUnfinishedMatchInfo[]>(() => {
+    if (apiUnfinishedMatches.length > 0) return apiUnfinishedMatches;
+    if (schedulerStatusRaw?.unfinishedMatches && schedulerStatusRaw.unfinishedMatches.length > 0) {
+      return schedulerStatusRaw.unfinishedMatches;
+    }
+    const list: CycleUnfinishedMatchInfo[] = [];
+    for (const t of portfolioTickets) {
+      const bk = (t.bookmakerId || 'SPORTYBET_TZ') as BookmakerId;
+      for (const sel of t.selections) {
+        const st = t.selectionSettlements.find((s) => s.selectionKey === sel.selectionKey);
+        const legStatus = st?.status || 'UPCOMING';
+        if (!isSelectionTerminal(legStatus)) {
+          list.push({
+            bookmakerId: bk,
+            cycleId: t.cycleId || feedStates[bk].activeCycleId || 'ACTIVE',
+            ticketId: t.internalTicketId,
+            eventId: sel.eventId,
+            selectionKey: sel.selectionKey,
+            homeTeam: sel.homeTeam,
+            awayTeam: sel.awayTeam,
+            kickoffMs: sel.estimateStartTime,
+            status: legStatus,
+            reason: st?.reason || 'Awaiting official result',
+          });
+        }
+      }
+    }
+    return list;
+  }, [apiUnfinishedMatches, schedulerStatusRaw?.unfinishedMatches, portfolioTickets, feedStates]);
+
+  const verificationFailures = useMemo<ResultVerificationFailure[]>(() => {
+    if (apiVerificationFailures.length > 0) return apiVerificationFailures;
+    return schedulerStatusRaw?.verificationFailures || [];
+  }, [apiVerificationFailures, schedulerStatusRaw?.verificationFailures]);
+
+  const matchResults = useMemo<MatchResultRecord[]>(() => {
+    if (apiMatchResults.length > 0) return apiMatchResults;
+    return firebaseMatchResultDocs.map((d) => ({
+      resultId: d.resultId || d.id,
+      bookmakerId: d.bookmakerId === 'BETPAWA_TZ' ? 'BETPAWA_TZ' : 'SPORTYBET_TZ',
+      eventId: d.eventId,
+      homeTeam: d.homeTeam,
+      awayTeam: d.awayTeam,
+      officialMatchStatus: d.officialMatchStatus,
+      status: d.status,
+      score: d.score,
+      verified: Boolean(d.verified),
+      reason: d.reason,
+      updatedAt: timestampValToIso(d.updatedAt),
+    }));
+  }, [apiMatchResults, firebaseMatchResultDocs]);
+
   const loadingPortfolio = !firebaseFeedLoaded && !apiLoaded;
 
   const schedulerStatus = useMemo<SchedulerStatus | null>(() => {
-    if (!schedulerStatusRaw && !firebasePublicStats) return null;
+    if (!schedulerStatusRaw && !firebasePublicStats && portfolioTickets.length === 0) return null;
     const base = schedulerStatusRaw;
     const fb = firebasePublicStats;
     const todayKey = new Intl.DateTimeFormat('en-CA', {
@@ -541,7 +824,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       month: '2-digit',
       day: '2-digit',
     }).format(new Date());
-    const todayMerged = portfolioTickets.filter((t) => t.generatedDateKey === todayKey);
+    const todayScoped = activeBookmakerTickets.filter((t) => t.generatedDateKey === todayKey);
 
     return {
       enabled: base?.enabled ?? true,
@@ -554,62 +837,60 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       lastScanningAt: base?.lastScanningAt ?? (fb?.lastScanningAt || null),
       lastSettlementAt: base?.lastSettlementAt ?? (fb?.lastSettlementAt || null),
       nextFactoryRunAt: base?.nextFactoryRunAt ?? null,
-      totalDailyTicketsToday: Math.max(
-        base?.totalDailyTicketsToday ?? 0,
-        fb?.totalGeneratedToday ?? 0,
-        todayMerged.length
-      ),
+      totalDailyTicketsToday:
+        todayScoped.length > 0 ? todayScoped.length : base?.totalDailyTicketsToday ?? 0,
       dailyTicketTarget: base?.dailyTicketTarget ?? fb?.dailyTicketTarget ?? 55,
-      liveFootballCount: Math.max(
-        base?.liveFootballCount ?? 0,
-        fb?.liveFootballCount ?? 0,
-        todayMerged.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length
-      ),
-      otherSportsCount: Math.max(
-        base?.otherSportsCount ?? 0,
-        fb?.otherSportsCount ?? 0,
-        todayMerged.filter((t) => t.feedSection === 'OTHER_SPORTS').length
-      ),
-      upcomingActiveCount: Math.max(
-        base?.upcomingActiveCount ?? 0,
-        fb?.upcomingActiveCount ?? 0,
-        todayMerged.filter(
-          (t) => (t.feedSection || 'UPCOMING') === 'UPCOMING' && !isTerminalStatus(t.status)
-        ).length
-      ),
-      settledWonCount: Math.max(
-        base?.settledWonCount ?? 0,
-        fb?.settledWonCount ?? 0,
-        portfolioTickets.filter((t) => t.status === 'WON').length
-      ),
-      settledLostCount: Math.max(
-        base?.settledLostCount ?? 0,
-        fb?.settledLostCount ?? 0,
-        portfolioTickets.filter((t) => t.status === 'LOST').length
-      ),
-      settledVoidCount: Math.max(
-        base?.settledVoidCount ?? 0,
-        fb?.settledVoidCount ?? 0,
-        portfolioTickets.filter((t) => t.status === 'VOID').length
-      ),
-      bookingCodesGeneratedToday: Math.max(
-        base?.bookingCodesGeneratedToday ?? 0,
-        fb?.bookingCodesGeneratedToday ?? 0,
-        todayMerged.filter((t) => Boolean(t.shareCode)).length
-      ),
-      bookingCodeFailuresToday: base?.bookingCodeFailuresToday ?? 0,
+      liveFootballCount:
+        todayScoped.length > 0
+          ? todayScoped.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length
+          : base?.liveFootballCount ?? 0,
+      otherSportsCount:
+        todayScoped.length > 0
+          ? todayScoped.filter((t) => t.feedSection === 'OTHER_SPORTS').length
+          : base?.otherSportsCount ?? 0,
+      upcomingActiveCount:
+        todayScoped.length > 0
+          ? todayScoped.filter(
+              (t) => (t.feedSection || 'UPCOMING') === 'UPCOMING' && !isTerminalStatus(t.status)
+            ).length
+          : base?.upcomingActiveCount ?? 0,
+      settledWonCount:
+        activeBookmakerTickets.length > 0
+          ? activeBookmakerTickets.filter((t) => t.status === 'WON').length
+          : base?.settledWonCount ?? 0,
+      settledLostCount:
+        activeBookmakerTickets.length > 0
+          ? activeBookmakerTickets.filter((t) => t.status === 'LOST').length
+          : base?.settledLostCount ?? 0,
+      settledVoidCount:
+        activeBookmakerTickets.length > 0
+          ? activeBookmakerTickets.filter((t) => t.status === 'VOID').length
+          : base?.settledVoidCount ?? 0,
+      bookingCodesGeneratedToday:
+        todayScoped.length > 0
+          ? todayScoped.filter((t) => Boolean(t.shareCode)).length
+          : base?.bookingCodesGeneratedToday ?? 0,
+      bookingCodeFailuresToday:
+        todayScoped.length > 0
+          ? todayScoped.filter((t) => t.bookingCodeStatus === 'FAILED').length
+          : base?.bookingCodeFailuresToday ?? 0,
       dailyShortfallReason: base?.dailyShortfallReason ?? null,
+      byBookmaker: feedStates,
+      unfinishedMatches,
+      verificationFailures,
     };
-  }, [schedulerStatusRaw, firebasePublicStats, portfolioTickets]);
+  }, [
+    schedulerStatusRaw,
+    firebasePublicStats,
+    portfolioTickets.length,
+    activeBookmakerTickets,
+    feedStates,
+    unfinishedMatches,
+    verificationFailures,
+  ]);
 
   const analyticsSummary = useMemo<PerformanceAnalyticsSummary | null>(() => {
-    if (
-      analyticsSummaryRaw &&
-      analyticsSummaryRaw.totalGenerated >= portfolioTickets.length
-    ) {
-      return analyticsSummaryRaw;
-    }
-    if (portfolioTickets.length === 0) {
+    if (activeBookmakerTickets.length === 0) {
       return analyticsSummaryRaw;
     }
 
@@ -620,16 +901,16 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       day: '2-digit',
     }).format(new Date());
 
-    const wonCount = portfolioTickets.filter((t) => t.status === 'WON').length;
-    const lostCount = portfolioTickets.filter((t) => t.status === 'LOST').length;
-    const voidCount = portfolioTickets.filter((t) => t.status === 'VOID').length;
-    const partiallySettledCount = portfolioTickets.filter(
+    const wonCount = activeBookmakerTickets.filter((t) => t.status === 'WON').length;
+    const lostCount = activeBookmakerTickets.filter((t) => t.status === 'LOST').length;
+    const voidCount = activeBookmakerTickets.filter((t) => t.status === 'VOID').length;
+    const partiallySettledCount = activeBookmakerTickets.filter(
       (t) => t.status === 'PARTIALLY_SETTLED'
     ).length;
-    const pendingOrLiveCount = portfolioTickets.filter(
+    const pendingOrLiveCount = activeBookmakerTickets.filter(
       (t) => t.status === 'PENDING' || t.status === 'LIVE'
     ).length;
-    const unverifiedCount = portfolioTickets.filter((t) => t.status === 'UNVERIFIED').length;
+    const unverifiedCount = activeBookmakerTickets.filter((t) => t.status === 'UNVERIFIED').length;
     const settledNonVoid = wonCount + lostCount;
 
     const buildRows = (
@@ -640,7 +921,11 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         const lost = list.filter((x) => x.status === 'LOST').length;
         const voided = list.filter((x) => x.status === 'VOID').length;
         const pending = list.filter(
-          (x) => x.status === 'PENDING' || x.status === 'LIVE' || x.status === 'PARTIALLY_SETTLED'
+          (x) =>
+            x.status === 'PENDING' ||
+            x.status === 'LIVE' ||
+            x.status === 'PARTIALLY_SETTLED' ||
+            x.status === 'UNVERIFIED'
         ).length;
         const denom = won + lost;
         return {
@@ -660,7 +945,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     const lgMap = new Map<string, GeneratedTicket[]>();
     const dayMap = new Map<string, GeneratedTicket[]>();
 
-    for (const t of portfolioTickets) {
+    for (const t of activeBookmakerTickets) {
       const catList = catMap.get(t.categoryLabel) || [];
       catList.push(t);
       catMap.set(t.categoryLabel, catList);
@@ -688,8 +973,8 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     }
 
     return {
-      totalGenerated: portfolioTickets.length,
-      generatedToday: portfolioTickets.filter((t) => t.generatedDateKey === todayKey).length,
+      totalGenerated: activeBookmakerTickets.length,
+      generatedToday: activeBookmakerTickets.filter((t) => t.generatedDateKey === todayKey).length,
       dailyTarget: schedulerStatus?.dailyTicketTarget ?? analyticsSummaryRaw?.dailyTarget ?? 55,
       totalSettled: wonCount + lostCount + voidCount,
       wonCount,
@@ -698,8 +983,8 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       partiallySettledCount,
       pendingOrLiveCount,
       unverifiedCount,
-      validSharingCodes: portfolioTickets.filter((t) => Boolean(t.shareCode)).length,
-      failedBookingCodes: portfolioTickets.filter((t) => !t.shareCode).length,
+      validSharingCodes: activeBookmakerTickets.filter((t) => Boolean(t.shareCode)).length,
+      failedBookingCodes: activeBookmakerTickets.filter((t) => !t.shareCode).length,
       settledNonVoidDenominator: settledNonVoid,
       winRatePct: settledNonVoid > 0 ? Number(((wonCount / settledNonVoid) * 100).toFixed(1)) : null,
       lastScanningAt: schedulerStatus?.lastScanningAt ?? analyticsSummaryRaw?.lastScanningAt ?? null,
@@ -721,7 +1006,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         analyticsSummaryRaw?.performanceDisclaimer ||
         'Win rates are computed strictly from verified finished official SportyBet TZ / betPawa TZ match results stored in Firebase (voided tickets excluded from win-rate denominator).',
     };
-  }, [analyticsSummaryRaw, portfolioTickets, schedulerStatus]);
+  }, [analyticsSummaryRaw, activeBookmakerTickets, schedulerStatus]);
 
   // Admin-Only State
   const [factoryConfig, setFactoryConfig] = useState<DailyFactoryConfig>(
@@ -732,6 +1017,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
   const [runningFactory, setRunningFactory] = useState(false);
   const [trackingResults, setTrackingResults] = useState(false);
   const [retryingCodes, setRetryingCodes] = useState(false);
+  const [retryingResults, setRetryingResults] = useState(false);
 
   const refreshPlatformStatus = useCallback(async () => {
     try {
@@ -969,21 +1255,30 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
 
   const refreshAnalytics = useCallback(async () => {
     try {
-      const summary = await apiClient.getPerformanceAnalytics();
+      const summary = await apiClient.getPerformanceAnalytics(activeBookmaker);
       setAnalyticsSummary(summary);
     } catch {
       // Ignore transient analytics fetch error
     }
-  }, []);
+  }, [activeBookmaker]);
 
   const refreshScheduler = useCallback(async () => {
     try {
-      const res = await apiClient.getSchedulerStatus();
+      const res = await apiClient.getSchedulerStatus(activeBookmaker);
       setSchedulerStatus(res.status);
+      if (res.feedStates) setApiFeedStates(res.feedStates);
+      if (Array.isArray(res.feedCycles)) setApiFeedCycles(res.feedCycles);
+      if (Array.isArray(res.matchResults)) setApiMatchResults(res.matchResults);
+      if (Array.isArray(res.verificationFailures)) {
+        setApiVerificationFailures(res.verificationFailures);
+      }
+      if (Array.isArray(res.status?.unfinishedMatches)) {
+        setApiUnfinishedMatches(res.status.unfinishedMatches);
+      }
     } catch {
       // Ignore transient scheduler fetch error
     }
-  }, []);
+  }, [activeBookmaker]);
 
   const loadAdminFactoryState = useCallback(async () => {
     if (!isAdmin) return;
@@ -994,6 +1289,12 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       const res = await apiClient.getDailyFactoryAdminState(token);
       setFactoryConfig(res.config);
       setSchedulerStatus(res.status);
+      if (res.feedStates) setApiFeedStates(res.feedStates);
+      if (Array.isArray(res.feedCycles)) setApiFeedCycles(res.feedCycles);
+      if (Array.isArray(res.unfinishedMatches)) setApiUnfinishedMatches(res.unfinishedMatches);
+      if (Array.isArray(res.verificationFailures)) {
+        setApiVerificationFailures(res.verificationFailures);
+      }
       setAutomationLogs(res.logs);
     } catch (err) {
       pushNotification(
@@ -1038,7 +1339,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     refreshScheduler,
   ]);
 
-  // Real-Time Firestore Listeners for Immutable Public Daily Feeds & Stats
+  // Real-Time Firestore Listeners for Immutable Public Daily Feeds, Cycles, Feed States & Results
   useEffect(() => {
     const unsubTickets = onSnapshot(
       query(collection(db, 'publicTickets'), where('isPublic', '==', true), limit(500)),
@@ -1084,10 +1385,58 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       }
     );
 
+    const unsubFeedStates = onSnapshot(
+      query(collection(db, 'bookmakerFeedStates'), where('isPublic', '==', true), limit(10)),
+      (snap) => {
+        setFirebaseFeedStateDocs(
+          snap.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as Omit<BookmakerFeedStateDocRecord, 'id'>),
+          }))
+        );
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'bookmakerFeedStates');
+      }
+    );
+
+    const unsubCycles = onSnapshot(
+      query(collection(db, 'feedCycles'), where('isPublic', '==', true), limit(100)),
+      (snap) => {
+        setFirebaseFeedCycleDocs(
+          snap.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as Omit<FeedCycleDocRecord, 'id'>),
+          }))
+        );
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'feedCycles');
+      }
+    );
+
+    const unsubMatchResults = onSnapshot(
+      query(collection(db, 'matchResults'), where('isPublic', '==', true), limit(500)),
+      (snap) => {
+        setFirebaseMatchResultDocs(
+          snap.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as Omit<MatchResultDocRecord, 'id'>),
+          }))
+        );
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'matchResults');
+      }
+    );
+
     return () => {
       unsubTickets();
       unsubUpdates();
       unsubStats();
+      unsubFeedStates();
+      unsubCycles();
+      unsubMatchResults();
     };
   }, []);
 
@@ -1353,7 +1702,14 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
   }, [getIdToken, isAdmin]);
 
   const syncPublicMirrorIfAdmin = useCallback(
-    async (ticketsToSync: GeneratedTicket[] = [], status?: SchedulerStatus | null) => {
+    async (
+      ticketsToSync: GeneratedTicket[] = [],
+      status?: SchedulerStatus | null,
+      extra?: {
+        cycles?: GenerationCycle[];
+        feedStates?: Record<BookmakerId, BookmakerFeedState>;
+      }
+    ) => {
       if (!user || !user.emailVerified || !isAdmin) return;
       const list = Array.isArray(ticketsToSync) ? ticketsToSync : [];
       for (let i = 0; i < Math.min(list.length, 200); i += 10) {
@@ -1361,6 +1717,18 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         await Promise.all(
           chunk.map((t) => syncPublicTicketBundle(user.uid, t).catch(() => {}))
         );
+      }
+
+      const statesToSync = extra?.feedStates || status?.byBookmaker || feedStates;
+      for (const bk of ['SPORTYBET_TZ', 'BETPAWA_TZ'] as BookmakerId[]) {
+        if (statesToSync[bk]) {
+          void syncBookmakerFeedState(statesToSync[bk]).catch(() => {});
+        }
+      }
+
+      const cyclesToSync = extra?.cycles || feedCycles;
+      for (const cyc of cyclesToSync.slice(0, 30)) {
+        void syncFeedCycleRecord(cyc).catch(() => {});
       }
 
       const todayKey = new Intl.DateTimeFormat('en-CA', {
@@ -1373,45 +1741,59 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
       const todayCombined = combined.filter((t) => t.generatedDateKey === todayKey);
 
       void savePublicStatsRecord({
+        statDocId: 'daily',
         dailyTicketTarget: status?.dailyTicketTarget ?? factoryConfig.dailyTicketTarget,
         totalGeneratedToday: Math.max(status?.totalDailyTicketsToday ?? 0, todayCombined.length),
         bookingCodesGeneratedToday: Math.max(
           status?.bookingCodesGeneratedToday ?? 0,
           todayCombined.filter((t) => Boolean(t.shareCode)).length
         ),
-        liveFootballCount: Math.max(
-          status?.liveFootballCount ?? 0,
-          todayCombined.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length
-        ),
-        otherSportsCount: Math.max(
-          status?.otherSportsCount ?? 0,
-          todayCombined.filter((t) => t.feedSection === 'OTHER_SPORTS').length
-        ),
-        upcomingActiveCount: Math.max(
-          status?.upcomingActiveCount ?? 0,
-          todayCombined.filter(
-            (t) => (t.feedSection || 'UPCOMING') === 'UPCOMING' && !isTerminalStatus(t.status)
-          ).length
-        ),
-        settledWonCount: Math.max(
-          status?.settledWonCount ?? 0,
-          combined.filter((t) => t.status === 'WON').length
-        ),
-        settledLostCount: Math.max(
-          status?.settledLostCount ?? 0,
-          combined.filter((t) => t.status === 'LOST').length
-        ),
-        settledVoidCount: Math.max(
-          status?.settledVoidCount ?? 0,
-          combined.filter((t) => t.status === 'VOID').length
-        ),
+        liveFootballCount: todayCombined.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length,
+        otherSportsCount: todayCombined.filter((t) => t.feedSection === 'OTHER_SPORTS').length,
+        upcomingActiveCount: todayCombined.filter(
+          (t) => (t.feedSection || 'UPCOMING') === 'UPCOMING' && !isTerminalStatus(t.status)
+        ).length,
+        settledWonCount: combined.filter((t) => t.status === 'WON').length,
+        settledLostCount: combined.filter((t) => t.status === 'LOST').length,
+        settledVoidCount: combined.filter((t) => t.status === 'VOID').length,
         lastScanningAt: status?.lastScanningAt ?? schedulerStatus?.lastScanningAt ?? null,
         lastSettlementAt: status?.lastSettlementAt ?? schedulerStatus?.lastSettlementAt ?? null,
       }).catch(() => {});
+
+      for (const bk of ['SPORTYBET_TZ', 'BETPAWA_TZ'] as BookmakerId[]) {
+        const bkAll = combined.filter((t) => (t.bookmakerId || 'SPORTYBET_TZ') === bk);
+        const bkToday = bkAll.filter((t) => t.generatedDateKey === todayKey);
+        const st = statesToSync[bk];
+        void savePublicStatsRecord({
+          statDocId: `daily_${bk}`,
+          bookmakerId: bk,
+          activeCycleId: st?.activeCycleId ?? null,
+          generationLocked: st?.generationLocked ?? false,
+          lockStatus: st?.lockStatus ?? 'UNLOCKED',
+          lockReason: st?.lockReason ?? '',
+          dailyTicketTarget: status?.dailyTicketTarget ?? factoryConfig.dailyTicketTarget,
+          totalGeneratedToday: bkToday.length,
+          bookingCodesGeneratedToday: bkToday.filter((t) => Boolean(t.shareCode)).length,
+          liveFootballCount: bkToday.filter((t) => t.feedSection === 'LIVE_FOOTBALL').length,
+          otherSportsCount: bkToday.filter((t) => t.feedSection === 'OTHER_SPORTS').length,
+          upcomingActiveCount: bkToday.filter(
+            (t) => (t.feedSection || 'UPCOMING') === 'UPCOMING' && !isTerminalStatus(t.status)
+          ).length,
+          unfinishedMatchesCount: st?.unfinishedMatchesCount ?? 0,
+          unsettledTicketsCount: st?.unsettledTicketsCount ?? 0,
+          settledWonCount: bkAll.filter((t) => t.status === 'WON').length,
+          settledLostCount: bkAll.filter((t) => t.status === 'LOST').length,
+          settledVoidCount: bkAll.filter((t) => t.status === 'VOID').length,
+          lastScanningAt: status?.lastScanningAt ?? schedulerStatus?.lastScanningAt ?? null,
+          lastSettlementAt: st?.lastResultCheckAt ?? status?.lastSettlementAt ?? null,
+        }).catch(() => {});
+      }
     },
     [
       apiTickets,
       factoryConfig.dailyTicketTarget,
+      feedCycles,
+      feedStates,
       firebaseTickets,
       isAdmin,
       schedulerStatus?.lastScanningAt,
@@ -1430,17 +1812,27 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     const missingInBackend = firebaseTickets.filter((fb) => {
       const apiMatch = apiById.get(fb.internalTicketId);
       if (!apiMatch) return true;
-      return isTerminalStatus(fb.status) && !isTerminalStatus(apiMatch.status);
+      if (isTerminalStatus(fb.status) && !isTerminalStatus(apiMatch.status)) return true;
+      const fbSettled = fb.selectionSettlements.filter((s) => isSelectionTerminal(s.status)).length;
+      const apiSettled = apiMatch.selectionSettlements.filter((s) =>
+        isSelectionTerminal(s.status)
+      ).length;
+      return fbSettled > apiSettled;
     });
 
-    if (missingInBackend.length > 0) {
-      const hydrationSig = missingInBackend.map((t) => `${t.internalTicketId}:${t.status}`).join('|');
+    if (missingInBackend.length > 0 || (firebaseFeedCycleDocs.length > 0 && apiFeedCycles.length === 0)) {
+      const hydrationSig =
+        missingInBackend.map((t) => `${t.internalTicketId}:${t.status}`).join('|') +
+        `#cyc:${firebaseFeedCycleDocs.length}`;
       if (hydratedKeyRef.current !== hydrationSig) {
         hydratedKeyRef.current = hydrationSig;
         void getIdToken().then((token) => {
           if (!token) return;
           void apiClient
-            .hydrateTickets(firebaseTickets.slice(0, 200), token)
+            .hydrateTickets(firebaseTickets.slice(0, 200), token, {
+              cycles: feedCycles,
+              feedStates,
+            })
             .then(() => {
               void refreshPortfolio();
               void refreshScheduler();
@@ -1454,10 +1846,18 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     const unsyncedToFirebase = apiTickets.filter((api) => {
       const fb = fbById.get(api.internalTicketId);
       if (!fb) return true;
-      if (isTerminalStatus(fb.status)) return false;
+      if (fb.status === 'WON' || fb.status === 'VOID') return false;
+      if (fb.status === 'LOST') {
+        const fbSettled = fb.selectionSettlements.filter((s) => isSelectionTerminal(s.status)).length;
+        const apiSettled = api.selectionSettlements.filter((s) =>
+          isSelectionTerminal(s.status)
+        ).length;
+        return apiSettled > fbSettled;
+      }
       return (
         isTerminalStatus(api.status) ||
         api.status !== fb.status ||
+        (api.settledMatchCount ?? 0) !== (fb.settledMatchCount ?? 0) ||
         (Boolean(api.shareCode) && !fb.shareCode)
       );
     });
@@ -1465,16 +1865,26 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     if (unsyncedToFirebase.length > 0) {
       const mirrorSig = unsyncedToFirebase
         .slice(0, 40)
-        .map((t) => `${t.internalTicketId}:${t.status}:${t.shareCode || ''}`)
+        .map(
+          (t) =>
+            `${t.internalTicketId}:${t.status}:${t.settledMatchCount ?? 0}:${t.shareCode || ''}`
+        )
         .join('|');
       if (autoMirroredKeyRef.current !== mirrorSig) {
         autoMirroredKeyRef.current = mirrorSig;
-        void syncPublicMirrorIfAdmin(unsyncedToFirebase, schedulerStatusRaw);
+        void syncPublicMirrorIfAdmin(unsyncedToFirebase, schedulerStatusRaw, {
+          cycles: feedCycles,
+          feedStates,
+        });
       }
     }
   }, [
+    apiFeedCycles.length,
     apiLoaded,
     apiTickets,
+    feedCycles,
+    feedStates,
+    firebaseFeedCycleDocs.length,
     firebaseFeedLoaded,
     firebaseTickets,
     getIdToken,
@@ -1535,29 +1945,46 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
     [isAdmin, pushNotification, requireAdminToken, user]
   );
 
-  const runFactoryNow = useCallback(async () => {
-    setRunningFactory(true);
-    try {
-      const token = await requireAdminToken();
-      const res = await apiClient.runDailyFactoryNow(token);
-      setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
-      setSchedulerStatus(res.status);
-      setAutomationLogs(res.logs);
-      await refreshAnalytics();
-      const toMirror =
-        Array.isArray(res.newTickets) && res.newTickets.length > 0 ? res.newTickets : res.tickets;
-      void syncPublicMirrorIfAdmin(toMirror, res.status);
-      if (user && user.emailVerified && isAdmin) {
-        void saveAdminAuditLogRecord(user, res.log).catch(() => {});
+  const runFactoryNow = useCallback(
+    async (targetBookmaker?: BookmakerId) => {
+      setRunningFactory(true);
+      try {
+        const token = await requireAdminToken();
+        const res = await apiClient.runDailyFactoryNow(token, targetBookmaker);
+        setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
+        setSchedulerStatus(res.status);
+        if (res.feedStates) setApiFeedStates(res.feedStates);
+        if (Array.isArray(res.feedCycles)) setApiFeedCycles(res.feedCycles);
+        if (Array.isArray(res.status?.unfinishedMatches)) {
+          setApiUnfinishedMatches(res.status.unfinishedMatches);
+        }
+        if (Array.isArray(res.status?.verificationFailures)) {
+          setApiVerificationFailures(res.status.verificationFailures);
+        }
+        setAutomationLogs(res.logs);
+        await refreshAnalytics();
+        const toMirror = Array.isArray(res.newTickets) ? res.newTickets : [];
+        void syncPublicMirrorIfAdmin(toMirror, res.status, {
+          cycles: res.feedCycles,
+          feedStates: res.feedStates,
+        });
+        if (user && user.emailVerified && isAdmin) {
+          void saveAdminAuditLogRecord(user, res.log).catch(() => {});
+        }
+        pushNotification(
+          res.log.status === 'SKIPPED' ? 'MARKET_UNAVAILABLE' : 'SCAN_COMPLETE',
+          res.log.status === 'SKIPPED' ? 'Cycle Lock Active' : 'Daily Factory Executed',
+          res.log.message
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Daily Factory execution failed';
+        pushNotification('INTEGRATION_ERROR', 'Daily Factory Error', msg);
+      } finally {
+        setRunningFactory(false);
       }
-      pushNotification('SCAN_COMPLETE', 'Daily Factory Executed', res.log.message);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Daily Factory execution failed';
-      pushNotification('INTEGRATION_ERROR', 'Daily Factory Error', msg);
-    } finally {
-      setRunningFactory(false);
-    }
-  }, [isAdmin, pushNotification, refreshAnalytics, requireAdminToken, syncPublicMirrorIfAdmin, user]);
+    },
+    [isAdmin, pushNotification, refreshAnalytics, requireAdminToken, syncPublicMirrorIfAdmin, user]
+  );
 
   const deletePortfolioTicket = useCallback(
     async (internalTicketId: string) => {
@@ -1637,20 +2064,28 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
   );
 
   const trackAllResultsNow = useCallback(
-    async (ticketIds?: string[]) => {
+    async (ticketIds?: string[], targetBookmaker?: BookmakerId) => {
       setTrackingResults(true);
       try {
         const token = await requireAdminToken();
-        const res = await apiClient.trackTicketsResults(token, ticketIds);
+        const res = await apiClient.trackTicketsResults(token, ticketIds, targetBookmaker);
         setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
         setSchedulerStatus(res.status);
+        if (res.feedStates) setApiFeedStates(res.feedStates);
+        if (Array.isArray(res.feedCycles)) setApiFeedCycles(res.feedCycles);
+        if (Array.isArray(res.status?.unfinishedMatches)) {
+          setApiUnfinishedMatches(res.status.unfinishedMatches);
+        }
+        if (Array.isArray(res.status?.verificationFailures)) {
+          setApiVerificationFailures(res.status.verificationFailures);
+        }
         setAutomationLogs(res.logs);
         await refreshAnalytics();
-        const mirrorBatch = [
-          ...(Array.isArray(res.updatedTickets) ? res.updatedTickets : []),
-          ...(Array.isArray(res.replenishedTickets) ? res.replenishedTickets : []),
-        ];
-        void syncPublicMirrorIfAdmin(mirrorBatch, res.status);
+        const mirrorBatch = Array.isArray(res.updatedTickets) ? res.updatedTickets : [];
+        void syncPublicMirrorIfAdmin(mirrorBatch, res.status, {
+          cycles: res.feedCycles,
+          feedStates: res.feedStates,
+        });
         if (user && user.emailVerified && isAdmin) {
           void saveAdminAuditLogRecord(user, res.log).catch(() => {});
         }
@@ -1660,6 +2095,42 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         pushNotification('INTEGRATION_ERROR', 'Results Tracking Error', msg);
       } finally {
         setTrackingResults(false);
+      }
+    },
+    [isAdmin, pushNotification, refreshAnalytics, requireAdminToken, syncPublicMirrorIfAdmin, user]
+  );
+
+  const retryFailedResultChecks = useCallback(
+    async (targetBookmaker?: BookmakerId) => {
+      setRetryingResults(true);
+      try {
+        const token = await requireAdminToken();
+        const res = await apiClient.retryFailedResultChecks(token, targetBookmaker);
+        setApiTickets(res.tickets.filter((t) => isTicketAllowedInDailyFeed(t)));
+        setSchedulerStatus(res.status);
+        if (res.feedStates) setApiFeedStates(res.feedStates);
+        if (Array.isArray(res.feedCycles)) setApiFeedCycles(res.feedCycles);
+        if (Array.isArray(res.status?.unfinishedMatches)) {
+          setApiUnfinishedMatches(res.status.unfinishedMatches);
+        }
+        if (Array.isArray(res.status?.verificationFailures)) {
+          setApiVerificationFailures(res.status.verificationFailures);
+        }
+        setAutomationLogs(res.logs);
+        await refreshAnalytics();
+        void syncPublicMirrorIfAdmin(res.updatedTickets || [], res.status, {
+          cycles: res.feedCycles,
+          feedStates: res.feedStates,
+        });
+        if (user && user.emailVerified && isAdmin) {
+          void saveAdminAuditLogRecord(user, res.log).catch(() => {});
+        }
+        pushNotification('SCAN_COMPLETE', 'Failed Result Checks Retried', res.log.message);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Retry failed result checks errored';
+        pushNotification('INTEGRATION_ERROR', 'Retry Results Error', msg);
+      } finally {
+        setRetryingResults(false);
       }
     },
     [isAdmin, pushNotification, refreshAnalytics, requireAdminToken, syncPublicMirrorIfAdmin, user]
@@ -1735,6 +2206,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         pushNotification,
         markLocalNotificationRead,
         portfolioTickets,
+        activeBookmakerTickets,
         loadingPortfolio,
         refreshPortfolio,
         isTicketFavorited,
@@ -1743,6 +2215,13 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         refreshAnalytics,
         schedulerStatus,
         refreshScheduler,
+        feedStates,
+        activeFeedState,
+        feedCycles,
+        activeCycle,
+        unfinishedMatches,
+        verificationFailures,
+        matchResults,
         factoryConfig,
         setFactoryConfig,
         automationLogs,
@@ -1750,6 +2229,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         runningFactory,
         trackingResults,
         retryingCodes,
+        retryingResults,
         loadAdminFactoryState,
         saveFactoryConfig,
         toggleAutomation,
@@ -1758,6 +2238,7 @@ export function OddsHunterProvider({ children }: { children: React.ReactNode }) 
         createBookingCodeForTicket,
         retryFailedBookingCodes,
         trackAllResultsNow,
+        retryFailedResultChecks,
       }}
     >
       {children}

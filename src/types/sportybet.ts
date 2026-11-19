@@ -33,12 +33,18 @@ export type TicketStatus =
   | 'UNVERIFIED';
 
 export type SelectionSettlementStatus =
+  | 'UPCOMING'
   | 'PENDING'
   | 'LIVE'
   | 'WON'
   | 'LOST'
   | 'VOID'
+  | 'POSTPONED'
+  | 'SUSPENDED'
   | 'UNVERIFIED';
+
+export type FeedLockStatus = 'LOCKED' | 'UNLOCKED';
+export type GenerationCycleStatus = 'ACTIVE' | 'SETTLED';
 
 export type FeedSection = 'UPCOMING' | 'LIVE_FOOTBALL' | 'OTHER_SPORTS';
 
@@ -295,6 +301,8 @@ export interface GeneratedTicket {
   bookmakerId?: BookmakerId;
   bookmakerName?: string;
   bookmakerUrl?: string;
+  cycleId?: string;
+  idempotencyKey?: string;
   feedSection?: FeedSection;
   sportId?: string;
   sportName?: string;
@@ -318,6 +326,9 @@ export interface GeneratedTicket {
   // Separate mutable settlement & booking code fields
   status: TicketStatus;
   effectiveCombinedOdds: number;
+  settledMatchCount?: number;
+  totalMatchCount?: number;
+  unfinishedMatchCount?: number;
   selectionSettlements: SelectionSettlementRecord[];
   shareCode: string | null;
   shareUrl: string | null;
@@ -329,6 +340,104 @@ export interface GeneratedTicket {
   lastCheckedAt: string | null;
 }
 
+export interface GenerationCycle {
+  cycleId: string;
+  idempotencyKey: string;
+  bookmakerId: BookmakerId;
+  dateKey: string;
+  status: GenerationCycleStatus;
+  generationLocked: boolean;
+  ticketIds: string[];
+  ticketCount: number;
+  totalMatches: number;
+  finishedMatches: number;
+  unfinishedMatches: number;
+  wonTickets: number;
+  lostTickets: number;
+  voidTickets: number;
+  createdAt: string;
+  updatedAt: string;
+  settledAt: string | null;
+}
+
+export interface BookmakerFeedState {
+  bookmakerId: BookmakerId;
+  bookmakerName: string;
+  activeCycleId: string | null;
+  generationLocked: boolean;
+  lockStatus: FeedLockStatus;
+  lockReason: string;
+  totalTicketsInCycle: number;
+  settledTicketsInCycle: number;
+  unsettledTicketsCount: number;
+  totalMatchesInCycle: number;
+  finishedMatchesCount: number;
+  unfinishedMatchesCount: number;
+  unverifiedMatchesCount: number;
+  verificationFailuresCount: number;
+  lastGenerationAt: string | null;
+  lastResultCheckAt: string | null;
+  lastUnlockedAt: string | null;
+  updatedAt: string;
+}
+
+export interface MatchResultRecord {
+  resultId: string;
+  bookmakerId: BookmakerId;
+  eventId: string;
+  homeTeam: string;
+  awayTeam: string;
+  officialMatchStatus: string;
+  status: SelectionSettlementStatus;
+  score: string;
+  verified: boolean;
+  reason: string;
+  updatedAt: string;
+}
+
+export interface CycleUnfinishedMatchInfo {
+  bookmakerId: BookmakerId;
+  cycleId: string;
+  ticketId: string;
+  eventId: string;
+  selectionKey: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoffMs: number;
+  status: SelectionSettlementStatus;
+  reason: string;
+}
+
+export interface ResultVerificationFailure {
+  failureId: string;
+  bookmakerId: BookmakerId;
+  eventId: string;
+  ticketIds: string[];
+  homeTeam: string;
+  awayTeam: string;
+  error: string;
+  attempts: number;
+  lastAttemptAt: string;
+}
+
+export interface BookmakerCycleLockEvaluation {
+  bookmakerId: BookmakerId;
+  activeCycleId: string | null;
+  generationLocked: boolean;
+  lockStatus: FeedLockStatus;
+  lockReason: string;
+  totalTicketsInCycle: number;
+  settledTicketsInCycle: number;
+  unsettledTicketsCount: number;
+  totalMatchesInCycle: number;
+  finishedMatchesCount: number;
+  unfinishedMatchesCount: number;
+  unverifiedMatchesCount: number;
+  verificationFailuresCount: number;
+  unfinishedMatches: CycleUnfinishedMatchInfo[];
+  unsettledTicketIds: string[];
+}
+
 export interface DailyFactoryConfig {
   activeBookmaker?: BookmakerId;
   enabled: boolean;
@@ -338,7 +447,7 @@ export interface DailyFactoryConfig {
   dailyTicketTarget: number; // Default >= 50 (e.g. 55)
   liveFootballTarget?: number; // Default >= 10 (e.g. 12)
   otherSportsTarget?: number; // Default >= 10 (e.g. 12)
-  autoReplenishOnSettle?: boolean; // Automatically generate new upcoming code when an active one finishes
+  autoReplenishOnSettle?: boolean; // Kept for schema compatibility; strict cycle lock governs new generation
   maxTickets: number;
   minSelections: number;
   maxSelections: number;
@@ -360,12 +469,15 @@ export interface DailyFactoryConfig {
 
 export interface AutomationJobLog {
   logId: string;
+  bookmakerId?: BookmakerId | 'ALL';
+  cycleId?: string | null;
   actionType:
     | 'AUTO_SCHEDULE'
     | 'MANUAL_TRIGGER'
     | 'SETTINGS_UPDATE'
     | 'RETRY_CODES'
     | 'RESULTS_CHECK'
+    | 'RETRY_RESULTS'
     | 'SYSTEM_TOGGLE';
   jobType: 'DAILY_FACTORY' | 'RESULTS_TRACKER' | 'ADMIN_ACTION';
   status: 'SUCCESS' | 'PARTIAL' | 'SKIPPED' | 'FAILED';
@@ -403,6 +515,9 @@ export interface SchedulerStatus {
   bookingCodesGeneratedToday: number;
   bookingCodeFailuresToday: number;
   dailyShortfallReason: string | null;
+  byBookmaker?: Record<BookmakerId, BookmakerFeedState>;
+  unfinishedMatches?: CycleUnfinishedMatchInfo[];
+  verificationFailures?: ResultVerificationFailure[];
 }
 
 export interface PerformanceBreakdownRow {

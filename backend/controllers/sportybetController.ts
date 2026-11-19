@@ -502,8 +502,11 @@ export async function getPublicTicketById(req: Request, res: Response) {
   res.json({ ticket });
 }
 
-export async function getPerformanceAnalytics(_req: Request, res: Response) {
-  const tickets = automationStore.getTickets();
+export async function getPerformanceAnalytics(req: Request, res: Response) {
+  const bkParam = req.query.bookmaker ? String(req.query.bookmaker).trim().toUpperCase() : '';
+  const bookmakerFilter: BookmakerId | undefined =
+    bkParam === 'SPORTYBET_TZ' || bkParam === 'BETPAWA_TZ' ? (bkParam as BookmakerId) : undefined;
+  const tickets = automationStore.getTickets(bookmakerFilter);
   const cfg = automationStore.getFactoryConfig();
   const meta = automationStore.getTimestamps();
   const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
@@ -516,9 +519,16 @@ export async function getPerformanceAnalytics(_req: Request, res: Response) {
   res.json(summary);
 }
 
-export async function getSchedulerStatus(_req: Request, res: Response) {
+export async function getSchedulerStatus(req: Request, res: Response) {
+  const bkParam = req.query.bookmaker ? String(req.query.bookmaker).trim().toUpperCase() : '';
+  const bookmakerFilter: BookmakerId | undefined =
+    bkParam === 'SPORTYBET_TZ' || bkParam === 'BETPAWA_TZ' ? (bkParam as BookmakerId) : undefined;
   res.json({
-    status: schedulerService.getStatus(),
+    status: schedulerService.getStatus(bookmakerFilter),
+    feedStates: automationStore.getFeedStates(),
+    feedCycles: automationStore.getFeedCycles(bookmakerFilter).slice(0, 40),
+    matchResults: automationStore.getMatchResults(bookmakerFilter).slice(0, 120),
+    verificationFailures: automationStore.getVerificationFailures(bookmakerFilter),
   });
 }
 
@@ -575,10 +585,16 @@ export async function runCronTrackResults(req: AdminRequest, res: Response) {
 // ==================================================
 
 export async function getDailyFactoryAdminState(_req: AdminRequest, res: Response) {
+  await schedulerService.ensureFirestoreHydrated();
+  const status = schedulerService.getStatus();
   res.json({
     config: automationStore.getFactoryConfig(),
-    status: schedulerService.getStatus(),
-    logs: automationStore.getLogs().slice(0, 80),
+    status,
+    feedStates: automationStore.getFeedStates(),
+    feedCycles: automationStore.getFeedCycles().slice(0, 60),
+    unfinishedMatches: status.unfinishedMatches || [],
+    verificationFailures: automationStore.getVerificationFailures(),
+    logs: automationStore.getLogs().slice(0, 100),
   });
 }
 
@@ -680,13 +696,21 @@ export async function toggleFactoryAutomation(req: AdminRequest, res: Response) 
 
 export async function runDailyFactoryNow(req: AdminRequest, res: Response) {
   try {
-    const result = await schedulerService.runDailyFactoryJob(true, req.adminUser?.email || null);
+    const rawBk = req.body?.bookmaker ?? req.query.bookmaker;
+    const targetBookmaker = rawBk ? normalizeBookmakerId(rawBk) : undefined;
+    const result = await schedulerService.runDailyFactoryJob(
+      true,
+      req.adminUser?.email || null,
+      targetBookmaker
+    );
     res.json({
       ...result,
       newTickets: result.tickets,
       status: schedulerService.getStatus(),
+      feedStates: automationStore.getFeedStates(),
+      feedCycles: automationStore.getFeedCycles().slice(0, 60),
       tickets: automationStore.getTickets(),
-      logs: automationStore.getLogs().slice(0, 80),
+      logs: automationStore.getLogs().slice(0, 100),
     });
   } catch (err) {
     handleError(res, err, 'DAILY_FACTORY_RUN_FAILED');
@@ -797,19 +821,47 @@ export async function trackTicketsResults(req: AdminRequest, res: Response) {
     const ticketIds = Array.isArray(req.body?.ticketIds)
       ? (req.body.ticketIds as string[])
       : undefined;
+    const rawBk = req.body?.bookmaker ?? req.query.bookmaker;
+    const targetBookmaker = rawBk ? normalizeBookmakerId(rawBk) : undefined;
+    const retryFailedOnly = Boolean(req.body?.retryFailedOnly);
+
     const result = await schedulerService.runResultsTrackingJob(
       true,
       ticketIds,
+      req.adminUser?.email || null,
+      { targetBookmaker, retryFailedOnly }
+    );
+    res.json({
+      ...result,
+      status: schedulerService.getStatus(),
+      feedStates: automationStore.getFeedStates(),
+      feedCycles: automationStore.getFeedCycles().slice(0, 60),
+      tickets: automationStore.getTickets(),
+      logs: automationStore.getLogs().slice(0, 100),
+    });
+  } catch (err) {
+    handleError(res, err, 'TRACK_RESULTS_FAILED');
+  }
+}
+
+export async function retryFailedResultChecksHandler(req: AdminRequest, res: Response) {
+  try {
+    const rawBk = req.body?.bookmaker ?? req.query.bookmaker;
+    const targetBookmaker = rawBk ? normalizeBookmakerId(rawBk) : undefined;
+    const result = await schedulerService.retryFailedResultChecks(
+      targetBookmaker,
       req.adminUser?.email || null
     );
     res.json({
       ...result,
       status: schedulerService.getStatus(),
+      feedStates: automationStore.getFeedStates(),
+      feedCycles: automationStore.getFeedCycles().slice(0, 60),
       tickets: automationStore.getTickets(),
-      logs: automationStore.getLogs().slice(0, 80),
+      logs: automationStore.getLogs().slice(0, 100),
     });
   } catch (err) {
-    handleError(res, err, 'TRACK_RESULTS_FAILED');
+    handleError(res, err, 'RETRY_RESULTS_FAILED');
   }
 }
 
@@ -818,13 +870,18 @@ export async function hydrateTicketsHandler(req: AdminRequest, res: Response) {
   if (!parsed.success) {
     return res.status(400).json({ error: 'Invalid Firebase ticket hydration payload.' });
   }
-  const hydratedCount = automationStore.hydrateTickets(
-    parsed.data.tickets as unknown as GeneratedTicket[]
-  );
+  const hydratedCount = automationStore.hydrateFromExternal({
+    tickets: parsed.data.tickets as unknown as GeneratedTicket[],
+    cycles: parsed.data.cycles as unknown as import('../../src/types/sportybet.ts').GenerationCycle[] | undefined,
+    feedStates: parsed.data.feedStates as unknown as Partial<Record<BookmakerId, import('../../src/types/sportybet.ts').BookmakerFeedState>> | undefined,
+    matchResults: parsed.data.matchResults as unknown as import('../../src/types/sportybet.ts').MatchResultRecord[] | undefined,
+  });
   res.json({
     hydratedCount,
     totalTickets: automationStore.getTickets().length,
     status: schedulerService.getStatus(),
+    feedStates: automationStore.getFeedStates(),
+    feedCycles: automationStore.getFeedCycles().slice(0, 60),
   });
 }
 

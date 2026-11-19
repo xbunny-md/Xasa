@@ -1,22 +1,32 @@
 import { useMemo, useState } from 'react';
 import {
-  AlertCircle,
-  Database,
+  CheckCircle2,
+  Clock,
   Flame,
+  History,
   RefreshCw,
   Search,
-  ShieldCheck,
+  Settings,
   Ticket,
   Trophy,
 } from 'lucide-react';
-import { useOddsHunter } from '../hooks/useOddsHunter.tsx';
 import { TicketPosterCard } from '../components/TicketPosterCard.tsx';
+import { useOddsHunter } from '../hooks/useOddsHunter.tsx';
+import type { FeedSection } from '../types/sportybet.ts';
 import { isTicketAllowedInDailyFeed } from '../utils/dailyFeedFilter.ts';
 import { formatDateTimeCompact } from '../utils/formatters.ts';
-import type { BookmakerId, FeedSection } from '../types/sportybet.ts';
 
-type FeedStatusFilter = 'ALL' | 'TODAY' | 'UPCOMING' | 'PENDING' | 'WON' | 'LOST' | 'VOID';
+type FeedStatusFilter =
+  | 'ALL'
+  | 'TODAY'
+  | 'UPCOMING'
+  | 'PENDING'
+  | 'WON'
+  | 'LOST'
+  | 'VOID'
+  | 'UNVERIFIED';
 type FeedSectionFilter = 'ALL' | FeedSection;
+type CycleScopeFilter = 'ALL_HISTORY' | 'ACTIVE_CYCLE' | string;
 type SortOption = 'newest' | 'odds_asc' | 'odds_desc' | 'kickoff_asc';
 
 function getTodayKeyTz(): string {
@@ -34,29 +44,49 @@ function getTodayKeyTz(): string {
 
 export function TicketFeedPage() {
   const {
-    portfolioTickets,
+    activeBookmaker,
+    activeBookmakerInfo,
+    activeBookmakerTickets,
+    activeFeedState,
+    activeCycle,
+    feedCycles,
     loadingPortfolio,
     refreshPortfolio,
-    analyticsSummary,
-    schedulerStatus,
     openTicketDetails,
     isTicketFavorited,
     toggleFavoriteTicket,
+    setActiveSection,
   } = useOddsHunter();
 
   const [sectionFilter, setSectionFilter] = useState<FeedSectionFilter>('ALL');
   const [statusFilter, setStatusFilter] = useState<FeedStatusFilter>('ALL');
   const [categoryFilter, setCategoryFilter] = useState<string>('ALL');
-  const [bookmakerFilter, setBookmakerFilter] = useState<'ALL' | BookmakerId>('ALL');
+  const [cycleScope, setCycleScope] = useState<CycleScopeFilter>('ALL_HISTORY');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<SortOption>('newest');
 
   const todayKey = useMemo(() => getTodayKeyTz(), []);
 
+  // Strictly displays only tickets belonging to the active preferred bookmaker
   const allowedTickets = useMemo(
-    () => portfolioTickets.filter((t) => isTicketAllowedInDailyFeed(t)),
-    [portfolioTickets]
+    () => activeBookmakerTickets.filter((t) => isTicketAllowedInDailyFeed(t)),
+    [activeBookmakerTickets]
   );
+
+  const bookmakerCycles = useMemo(
+    () => feedCycles.filter((c) => c.bookmakerId === activeBookmaker),
+    [feedCycles, activeBookmaker]
+  );
+
+  const cycleScopedTickets = useMemo(() => {
+    if (cycleScope === 'ALL_HISTORY') return allowedTickets;
+    if (cycleScope === 'ACTIVE_CYCLE') {
+      const targetCycleId = activeFeedState.activeCycleId || activeCycle?.cycleId;
+      if (!targetCycleId) return allowedTickets;
+      return allowedTickets.filter((t) => t.cycleId === targetCycleId);
+    }
+    return allowedTickets.filter((t) => t.cycleId === cycleScope);
+  }, [allowedTickets, cycleScope, activeFeedState.activeCycleId, activeCycle?.cycleId]);
 
   const feedCounts = useMemo(() => {
     const now = Date.now();
@@ -69,8 +99,9 @@ export function TicketFeedPage() {
     let won = 0;
     let lost = 0;
     let voided = 0;
+    let unverified = 0;
 
-    for (const t of allowedTickets) {
+    for (const t of cycleScopedTickets) {
       const sec = t.feedSection || 'UPCOMING';
       if (sec === 'LIVE_FOOTBALL') liveFootballSec++;
       else if (sec === 'OTHER_SPORTS') otherSportsSec++;
@@ -78,14 +109,17 @@ export function TicketFeedPage() {
 
       if (t.generatedDateKey === todayKey) today++;
       if (t.kickoffStartMs > now && t.status === 'PENDING') upcomingKickoff++;
-      if (t.status === 'PENDING' || t.status === 'LIVE') pending++;
+      if (t.status === 'PENDING' || t.status === 'LIVE' || t.status === 'PARTIALLY_SETTLED') {
+        pending++;
+      }
       if (t.status === 'WON') won++;
       if (t.status === 'LOST') lost++;
       if (t.status === 'VOID') voided++;
+      if (t.status === 'UNVERIFIED') unverified++;
     }
 
     return {
-      total: allowedTickets.length,
+      total: cycleScopedTickets.length,
       upcomingSec,
       liveFootballSec,
       otherSportsSec,
@@ -95,24 +129,25 @@ export function TicketFeedPage() {
       won,
       lost,
       voided,
+      unverified,
     };
-  }, [allowedTickets, todayKey]);
+  }, [cycleScopedTickets, todayKey]);
 
   const categoryOptions = useMemo(() => {
     const map = new Map<string, string>();
-    for (const t of allowedTickets) {
+    for (const t of cycleScopedTickets) {
       if (t.categoryId && t.categoryLabel) {
         map.set(t.categoryId, t.categoryLabel);
       }
     }
     return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
-  }, [allowedTickets]);
+  }, [cycleScopedTickets]);
 
   const filteredTickets = useMemo(() => {
     const now = Date.now();
     const q = searchQuery.trim().toLowerCase();
 
-    const list = allowedTickets.filter((t) => {
+    const list = cycleScopedTickets.filter((t) => {
       const sec: FeedSection = t.feedSection || 'UPCOMING';
       if (sectionFilter !== 'ALL' && sec !== sectionFilter) return false;
 
@@ -120,17 +155,20 @@ export function TicketFeedPage() {
       if (statusFilter === 'UPCOMING' && !(t.kickoffStartMs > now && t.status === 'PENDING')) {
         return false;
       }
-      if (statusFilter === 'PENDING' && t.status !== 'PENDING' && t.status !== 'LIVE') {
+      if (
+        statusFilter === 'PENDING' &&
+        t.status !== 'PENDING' &&
+        t.status !== 'LIVE' &&
+        t.status !== 'PARTIALLY_SETTLED'
+      ) {
         return false;
       }
       if (statusFilter === 'WON' && t.status !== 'WON') return false;
       if (statusFilter === 'LOST' && t.status !== 'LOST') return false;
       if (statusFilter === 'VOID' && t.status !== 'VOID') return false;
+      if (statusFilter === 'UNVERIFIED' && t.status !== 'UNVERIFIED') return false;
 
       if (categoryFilter !== 'ALL' && t.categoryId !== categoryFilter) return false;
-      if (bookmakerFilter !== 'ALL' && (t.bookmakerId || 'SPORTYBET_TZ') !== bookmakerFilter) {
-        return false;
-      }
 
       if (q) {
         const matchesId = t.internalTicketId.toLowerCase().includes(q);
@@ -159,116 +197,212 @@ export function TicketFeedPage() {
       return new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime();
     });
   }, [
-    allowedTickets,
+    cycleScopedTickets,
     sectionFilter,
     statusFilter,
     categoryFilter,
-    bookmakerFilter,
     searchQuery,
     sortBy,
     todayKey,
   ]);
 
-  const todayCount =
-    schedulerStatus?.totalDailyTicketsToday ?? analyticsSummary?.generatedToday ?? feedCounts.today;
-  const dailyTarget = schedulerStatus?.dailyTicketTarget ?? analyticsSummary?.dailyTarget ?? 55;
-  const bookingCodesCount =
-    schedulerStatus?.bookingCodesGeneratedToday ??
-    analyticsSummary?.validSharingCodes ??
-    allowedTickets.filter((t) => Boolean(t.shareCode)).length;
-  const wonCount = Math.max(schedulerStatus?.settledWonCount ?? 0, feedCounts.won);
-  const lostCount = Math.max(schedulerStatus?.settledLostCount ?? 0, feedCounts.lost);
-  const voidCount = Math.max(schedulerStatus?.settledVoidCount ?? 0, feedCounts.voided);
+  const bookingCodesCount = cycleScopedTickets.filter((t) => Boolean(t.shareCode)).length;
+
+  // User-friendly generation status presentation (underlying lock state preserved exactly)
+  const generationBanner = useMemo(() => {
+    if (activeFeedState.generationLocked) {
+      const remaining = activeFeedState.unfinishedMatchesCount;
+      if (
+        activeFeedState.unverifiedMatchesCount > 0 ||
+        activeFeedState.verificationFailuresCount > 0
+      ) {
+        return {
+          title: 'Results being updated',
+          note:
+            remaining > 0
+              ? `Checking final scores for ${remaining} remaining match${remaining === 1 ? '' : 'es'}.`
+              : 'Confirming official final results for this round.',
+          tone: 'amber' as const,
+          Icon: RefreshCw,
+        };
+      }
+      return {
+        title: 'Waiting for all matches to finish',
+        note:
+          remaining > 0
+            ? `${remaining} match${remaining === 1 ? '' : 'es'} still to finish before new picks open.`
+            : 'Current round matches are in progress.',
+        tone: 'blue' as const,
+        Icon: Clock,
+      };
+    }
+
+    return {
+      title: 'New picks pending',
+      note:
+        allowedTickets.length > 0
+          ? 'All matches from the latest round have finished.'
+          : `Fresh picks for ${activeBookmakerInfo.name} will appear shortly.`,
+      tone: 'emerald' as const,
+      Icon: CheckCircle2,
+    };
+  }, [
+    activeFeedState.generationLocked,
+    activeFeedState.unfinishedMatchesCount,
+    activeFeedState.unverifiedMatchesCount,
+    activeFeedState.verificationFailuresCount,
+    allowedTickets.length,
+    activeBookmakerInfo.name,
+  ]);
+
+  const [brandIconError, setBrandIconError] = useState(false);
+
+  const StatusBannerIcon = generationBanner.Icon;
 
   return (
     <div className="space-y-6">
-      {/* Compact Hero Summary Strip */}
-      <section className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] p-4 sm:p-5 shadow-xs dark:shadow-none">
-        <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-4">
-          <div className="space-y-1">
-            <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-blue-700 dark:text-blue-300">
-              <ShieldCheck className="w-4 h-4 shrink-0" />
-              <span>Immutable Firebase Daily Feed · Strict 1.01–1.25 Filter</span>
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 font-mono text-[10px]">
-                <Database className="w-3 h-3" />
-                Firebase Synced
-              </span>
+      {/* Daily Picks Hero Header & Compact Stats */}
+      <section className="relative overflow-hidden rounded-2xl bg-white/95 dark:bg-gradient-to-br dark:from-[#0E1629]/95 dark:via-[#0B1222]/92 dark:to-[#080D1A]/95 dark:backdrop-blur-xl border border-slate-200 dark:border-white/[0.09] p-5 sm:p-6 shadow-xs dark:shadow-[0_24px_60px_-28px_rgba(2,6,23,0.95)] space-y-5 transition-colors">
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute -top-24 -right-24 h-64 w-64 rounded-full bg-blue-500/[0.06] dark:bg-blue-500/[0.11] blur-3xl"
+        />
+
+        <div className="relative flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+          <div className="flex items-center gap-3.5 sm:gap-4 min-w-0">
+            <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-2xl bg-black border border-slate-300/80 dark:border-white/15 shadow-md overflow-hidden flex items-center justify-center shrink-0">
+              {!brandIconError ? (
+                <img
+                  src="/assets/aistudio/1795084245256_fb70236e.jpg"
+                  alt="Daily Picks Icon"
+                  referrerPolicy="no-referrer"
+                  onError={() => setBrandIconError(true)}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <Ticket className="w-6 h-6 text-slate-200" />
+              )}
             </div>
-            <h2 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
-              Daily Automated Odds Tickets
-            </h2>
-            <p className="text-xs text-slate-600 dark:text-slate-400">
-              Tickets stay permanently stored in Firebase with locked WON / LOST / VOID outcomes.
-              When an upcoming code finishes, a fresh upcoming replacement code is automatically generated
-              alongside 10+ Live Football and 10+ Other Games cards.
-            </p>
+
+            <div className="min-w-0 space-y-0.5">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-blue-600 dark:text-blue-400 block">
+                Daily Picks
+              </span>
+              <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-white truncate">
+                {activeBookmakerInfo.name}
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400">
+                Curated accumulators, live match progress, and ready-to-copy booking codes
+                {activeFeedState.lastResultCheckAt
+                  ? ` · Updated ${formatDateTimeCompact(activeFeedState.lastResultCheckAt)}`
+                  : ''}
+              </p>
+            </div>
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 shrink-0">
-            <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
-              <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Today&apos;s Feed
-              </span>
-              <span className="font-mono text-lg font-bold text-slate-900 dark:text-white tabular-nums">
-                {todayCount}
-                <span className="text-xs font-normal text-slate-500">/{dailyTarget}</span>
-              </span>
+          {/* Polished Status Indicator */}
+          <div className="flex flex-wrap items-center gap-2.5 self-start lg:self-center">
+            <div
+              className={`rounded-xl border px-3.5 py-2.5 flex items-center gap-2.5 text-xs ${
+                generationBanner.tone === 'amber'
+                  ? 'bg-amber-50/90 border-amber-200 text-amber-800 dark:bg-amber-500/10 dark:border-amber-500/25 dark:text-amber-200'
+                  : generationBanner.tone === 'blue'
+                    ? 'bg-blue-50/90 border-blue-200 text-blue-800 dark:bg-blue-500/10 dark:border-blue-500/25 dark:text-blue-200'
+                    : 'bg-emerald-50/90 border-emerald-200 text-emerald-800 dark:bg-emerald-500/10 dark:border-emerald-500/25 dark:text-emerald-200'
+              }`}
+            >
+              <StatusBannerIcon className="w-4 h-4 shrink-0" />
+              <div className="min-w-0">
+                <div className="font-semibold leading-tight">{generationBanner.title}</div>
+                <div className="text-[11px] opacity-85 mt-0.5">{generationBanner.note}</div>
+              </div>
             </div>
-            <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
-              <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Live FB · Other
-              </span>
-              <span className="font-mono text-lg font-bold text-amber-700 dark:text-amber-300 tabular-nums">
-                {feedCounts.liveFootballSec}
-                <span className="text-xs font-normal text-slate-500"> · {feedCounts.otherSportsSec}</span>
-              </span>
-            </div>
-            <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
-              <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Won / Lost / Void
-              </span>
-              <span className="font-mono text-sm font-bold tabular-nums block mt-1">
-                <span className="text-emerald-700 dark:text-emerald-300">{wonCount}W</span>
-                <span className="text-slate-400"> · </span>
-                <span className="text-rose-700 dark:text-rose-300">{lostCount}L</span>
-                <span className="text-slate-400"> · </span>
-                <span className="text-slate-600 dark:text-slate-300">{voidCount}V</span>
-              </span>
-            </div>
-            <div className="px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.07]">
-              <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Codes · Scan
-              </span>
-              <span className="font-mono text-sm font-bold text-emerald-700 dark:text-emerald-300 tabular-nums">
-                {bookingCodesCount} codes
-              </span>
-              <span className="font-mono text-[10px] text-slate-500 block truncate">
-                {schedulerStatus?.lastScanningAt
-                  ? formatDateTimeCompact(schedulerStatus.lastScanningAt)
-                  : 'Ready'}
-              </span>
-            </div>
+
+            <button
+              type="button"
+              onClick={() => void refreshPortfolio()}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.11] border border-slate-200 dark:border-white/[0.1] text-xs font-semibold text-slate-800 dark:text-slate-100 whitespace-nowrap shrink-0 transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingPortfolio ? 'animate-spin' : ''}`} />
+              <span>Refresh</span>
+            </button>
           </div>
         </div>
 
-        {schedulerStatus?.dailyShortfallReason && (
-          <div className="mt-3 pt-3 border-t border-slate-200 dark:border-white/[0.06] flex items-start gap-2 text-xs text-amber-700 dark:text-amber-300/90">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-            <span>{schedulerStatus.dailyShortfallReason}</span>
+        {/* 5 Compact Statistic Cards */}
+        <div className="relative grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 sm:gap-3">
+          <div className="rounded-xl bg-slate-50/90 dark:bg-white/[0.035] border border-slate-200/80 dark:border-white/[0.08] px-3.5 py-3 transition-colors">
+            <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 block">
+              Saved Tickets
+            </span>
+            <span className="mt-1 font-display text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tabular-nums block">
+              {feedCounts.total}
+            </span>
           </div>
-        )}
+
+          <div className="rounded-xl bg-slate-50/90 dark:bg-white/[0.035] border border-slate-200/80 dark:border-white/[0.08] px-3.5 py-3 transition-colors">
+            <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 block">
+              Matches Settled
+            </span>
+            <span className="mt-1 font-display text-xl sm:text-2xl font-bold text-blue-700 dark:text-blue-300 tabular-nums block">
+              {activeFeedState.finishedMatchesCount}
+              <span className="text-xs font-normal text-slate-500 dark:text-slate-400">
+                /{activeFeedState.totalMatchesInCycle}
+              </span>
+            </span>
+          </div>
+
+          <div className="rounded-xl bg-slate-50/90 dark:bg-white/[0.035] border border-slate-200/80 dark:border-white/[0.08] px-3.5 py-3 transition-colors">
+            <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 block">
+              Won Tickets
+            </span>
+            <span className="mt-1 font-display text-xl sm:text-2xl font-bold text-emerald-700 dark:text-emerald-300 tabular-nums block">
+              {feedCounts.won}
+            </span>
+          </div>
+
+          <div className="rounded-xl bg-slate-50/90 dark:bg-white/[0.035] border border-slate-200/80 dark:border-white/[0.08] px-3.5 py-3 transition-colors">
+            <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 block">
+              Lost Tickets
+            </span>
+            <span className="mt-1 font-display text-xl sm:text-2xl font-bold text-rose-700 dark:text-rose-300 tabular-nums block">
+              {feedCounts.lost}
+            </span>
+          </div>
+
+          <div className="col-span-2 sm:col-span-1 rounded-xl bg-slate-50/90 dark:bg-white/[0.035] border border-slate-200/80 dark:border-white/[0.08] px-3.5 py-3 transition-colors">
+            <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 block">
+              Available Booking Codes
+            </span>
+            <span className="mt-1 font-display text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tabular-nums block">
+              {bookingCodesCount}
+            </span>
+          </div>
+        </div>
       </section>
 
-      {/* Feed Section Selector (Upcoming Football, 10+ Live Football, 10+ Other Games) */}
+      {/* Feed Navigation & Filter Controls */}
       <section className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2.5">
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
             {(
               [
-                { id: 'ALL', label: `All Feed (${feedCounts.total})`, icon: Ticket },
-                { id: 'UPCOMING', label: `Upcoming Football (${feedCounts.upcomingSec})`, icon: ShieldCheck },
-                { id: 'LIVE_FOOTBALL', label: `Live Football 10+ (${feedCounts.liveFootballSec})`, icon: Flame },
-                { id: 'OTHER_SPORTS', label: `Other Games 10+ (${feedCounts.otherSportsSec})`, icon: Trophy },
+                { id: 'ALL', label: `All Picks (${feedCounts.total})`, icon: Ticket },
+                {
+                  id: 'UPCOMING',
+                  label: `Upcoming (${feedCounts.upcomingSec})`,
+                  icon: Clock,
+                },
+                {
+                  id: 'LIVE_FOOTBALL',
+                  label: `Live Football (${feedCounts.liveFootballSec})`,
+                  icon: Flame,
+                },
+                {
+                  id: 'OTHER_SPORTS',
+                  label: `Other Games (${feedCounts.otherSportsSec})`,
+                  icon: Trophy,
+                },
               ] as const
             ).map((sec) => {
               const Icon = sec.icon;
@@ -278,10 +412,10 @@ export function TicketFeedPage() {
                   key={sec.id}
                   type="button"
                   onClick={() => setSectionFilter(sec.id)}
-                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors border ${
+                  className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition-all duration-150 border ${
                     active
-                      ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white'
-                      : 'bg-white text-slate-700 hover:text-slate-900 border-slate-200 dark:bg-[#111827] dark:text-slate-300 dark:hover:text-white dark:border-white/[0.08]'
+                      ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white shadow-xs'
+                      : 'bg-white text-slate-700 hover:text-slate-900 border-slate-200 dark:bg-[#0F172A]/80 dark:text-slate-300 dark:hover:text-white dark:border-white/[0.08]'
                   }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
@@ -292,46 +426,37 @@ export function TicketFeedPage() {
           </div>
         </div>
 
-        {/* Status Filter Tabs & Refresh */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-            {(
-              [
-                { id: 'ALL', label: `All (${feedCounts.total})` },
-                { id: 'TODAY', label: `Today (${feedCounts.today})` },
-                { id: 'UPCOMING', label: `Upcoming (${feedCounts.upcomingKickoff})` },
-                { id: 'PENDING', label: `Pending (${feedCounts.pending})` },
-                { id: 'WON', label: `Won (${feedCounts.won})` },
-                { id: 'LOST', label: `Lost (${feedCounts.lost})` },
-                { id: 'VOID', label: `Void (${feedCounts.voided})` },
-              ] as const
-            ).map((tab) => {
-              const active = statusFilter === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => setStatusFilter(tab.id)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors border ${
-                    active
-                      ? 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-600/20 dark:text-blue-200 dark:border-blue-500/40'
-                      : 'bg-white text-slate-600 hover:text-slate-900 border-slate-200 dark:bg-[#111827] dark:text-slate-400 dark:hover:text-white dark:border-white/[0.08]'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              );
-            })}
-          </div>
-
-          <button
-            type="button"
-            onClick={() => void refreshPortfolio()}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border-slate-200 text-slate-700 dark:bg-[#111827] dark:hover:bg-[#1A2438] border dark:border-white/[0.08] text-xs font-medium dark:text-slate-300 whitespace-nowrap"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${loadingPortfolio ? 'animate-spin' : ''}`} />
-            <span>Refresh Feed</span>
-          </button>
+        <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+          {(
+            [
+              { id: 'ALL', label: `All (${feedCounts.total})` },
+              { id: 'TODAY', label: `Today (${feedCounts.today})` },
+              { id: 'UPCOMING', label: `Upcoming (${feedCounts.upcomingKickoff})` },
+              { id: 'PENDING', label: `In Progress (${feedCounts.pending})` },
+              { id: 'WON', label: `Won (${feedCounts.won})` },
+              { id: 'LOST', label: `Lost (${feedCounts.lost})` },
+              { id: 'VOID', label: `Void (${feedCounts.voided})` },
+              ...(feedCounts.unverified > 0
+                ? [{ id: 'UNVERIFIED' as const, label: `Updating (${feedCounts.unverified})` }]
+                : []),
+            ] as const
+          ).map((tab) => {
+            const active = statusFilter === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setStatusFilter(tab.id)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors border ${
+                  active
+                    ? 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-600/20 dark:text-blue-200 dark:border-blue-500/40'
+                    : 'bg-white text-slate-600 hover:text-slate-900 border-slate-200 dark:bg-[#0F172A]/70 dark:text-slate-400 dark:hover:text-white dark:border-white/[0.08]'
+                }`}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
@@ -341,29 +466,40 @@ export function TicketFeedPage() {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search code, team, sport, league..."
-              className="w-full pl-9 pr-3 py-2 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500/40"
+              placeholder="Search team, league, or code..."
+              className="w-full pl-9 pr-3 py-2.5 rounded-xl bg-white dark:bg-[#0F172A]/80 border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500/50"
             />
           </label>
 
-          <select
-            value={bookmakerFilter}
-            onChange={(e) => setBookmakerFilter(e.target.value as 'ALL' | BookmakerId)}
-            aria-label="Filter by bookmaker"
-            className="px-3 py-2 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500/40"
-          >
-            <option value="ALL">All Bookmakers</option>
-            <option value="SPORTYBET_TZ">SportyBet TZ</option>
-            <option value="BETPAWA_TZ">betPawa TZ</option>
-          </select>
+          <div className="relative flex items-center">
+            <History className="w-4 h-4 text-slate-400 dark:text-slate-500 absolute left-3 pointer-events-none" />
+            <select
+              value={cycleScope}
+              onChange={(e) => setCycleScope(e.target.value)}
+              aria-label="Filter by round history"
+              className="w-full pl-9 pr-3 py-2.5 rounded-xl bg-white dark:bg-[#0F172A]/80 border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500/50"
+            >
+              <option value="ALL_HISTORY">
+                All Saved Rounds ({bookmakerCycles.length})
+              </option>
+              {(activeFeedState.activeCycleId || activeCycle?.cycleId) && (
+                <option value="ACTIVE_CYCLE">Current Round</option>
+              )}
+              {bookmakerCycles.map((cyc, index) => (
+                <option key={cyc.cycleId} value={cyc.cycleId}>
+                  {cyc.dateKey} · Round {bookmakerCycles.length - index} ({cyc.ticketCount} picks)
+                </option>
+              ))}
+            </select>
+          </div>
 
           <select
             value={categoryFilter}
             onChange={(e) => setCategoryFilter(e.target.value)}
-            aria-label="Filter by odds category"
-            className="px-3 py-2 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500/40"
+            aria-label="Filter by odds range"
+            className="px-3 py-2.5 rounded-xl bg-white dark:bg-[#0F172A]/80 border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500/50"
           >
-            <option value="ALL">All Odds Categories</option>
+            <option value="ALL">All Odds Ranges</option>
             {categoryOptions.map((cat) => (
               <option key={cat.id} value={cat.id}>
                 {cat.label} Odds
@@ -374,38 +510,66 @@ export function TicketFeedPage() {
           <select
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value as SortOption)}
-            aria-label="Sort tickets"
-            className="px-3 py-2 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500/40"
+            aria-label="Sort picks"
+            className="px-3 py-2.5 rounded-xl bg-white dark:bg-[#0F172A]/80 border border-slate-200 dark:border-white/[0.08] text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500/50"
           >
-            <option value="newest">Newest Generated First</option>
-            <option value="odds_asc">Lowest Combined Odds First</option>
-            <option value="odds_desc">Highest Combined Odds First</option>
-            <option value="kickoff_asc">Soonest Kickoff First</option>
+            <option value="newest">Newest First</option>
+            <option value="odds_asc">Lowest Odds First</option>
+            <option value="odds_desc">Highest Odds First</option>
+            <option value="kickoff_asc">Soonest Kickoff</option>
           </select>
         </div>
       </section>
 
-      {/* Two-Column Movie-Poster Grid on Mobile, Multi-Column Poster Grid on Desktop */}
-      {loadingPortfolio && portfolioTickets.length === 0 ? (
+      {/* Responsive 2-Column Mobile / Multi-Column Desktop Card Grid */}
+      {loadingPortfolio && allowedTickets.length === 0 ? (
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 sm:gap-4">
           {Array.from({ length: 8 }).map((_, idx) => (
             <div
               key={idx}
-              className="h-60 rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.06] animate-pulse"
+              className="h-64 rounded-2xl bg-white dark:bg-[#0F172A]/75 border border-slate-200 dark:border-white/[0.06] animate-pulse"
             />
           ))}
         </div>
       ) : filteredTickets.length === 0 ? (
-        <div className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] p-10 text-center space-y-2 shadow-xs dark:shadow-none">
+        <div className="rounded-2xl bg-white dark:bg-[#0F172A]/85 dark:backdrop-blur-md border border-slate-200 dark:border-white/[0.08] p-10 text-center space-y-3 shadow-xs dark:shadow-none">
           <Ticket className="w-8 h-8 text-slate-400 dark:text-slate-500 mx-auto" />
-          <p className="text-sm font-medium text-slate-800 dark:text-slate-200">
-            No tickets match the selected filter
-          </p>
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            {portfolioTickets.length === 0
-              ? 'The Daily Factory checks live Tanzania bookmaker fixtures automatically and persists eligible tickets to Firebase.'
-              : 'Clear search terms or select All Feed / All Tickets to view stored daily cards.'}
-          </p>
+          <div className="space-y-1">
+            <p className="text-sm font-semibold text-slate-900 dark:text-white">
+              {allowedTickets.length === 0
+                ? `No daily picks available yet for ${activeBookmakerInfo.name}`
+                : 'No picks match your current filters'}
+            </p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+              {allowedTickets.length === 0
+                ? 'Fresh daily tickets appear automatically once ready, or you can change your preferred bookmaker in Settings.'
+                : 'Try clearing your search or choosing All Picks to browse saved tickets.'}
+            </p>
+          </div>
+          {allowedTickets.length === 0 ? (
+            <button
+              type="button"
+              onClick={() => setActiveSection('settings')}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white transition-colors"
+            >
+              <Settings className="w-3.5 h-3.5" />
+              <span>Open Settings</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                setSectionFilter('ALL');
+                setStatusFilter('ALL');
+                setCategoryFilter('ALL');
+                setCycleScope('ALL_HISTORY');
+                setSearchQuery('');
+              }}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.08] dark:hover:bg-white/[0.12] text-xs font-semibold text-slate-800 dark:text-slate-200 transition-colors"
+            >
+              <span>Reset Filters</span>
+            </button>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 sm:gap-4">

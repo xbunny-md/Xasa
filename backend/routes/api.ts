@@ -30,6 +30,7 @@ import {
   previewTransfer,
   recordAuthAudit,
   retryFailedBookingCodesHandler,
+  retryFailedResultChecksHandler,
   runCronDailyFactory,
   runCronTrackResults,
   runDailyFactoryNow,
@@ -108,6 +109,7 @@ apiRouter.post(
 apiRouter.post('/tickets/retry-booking-codes', requireAdmin, retryFailedBookingCodesHandler);
 apiRouter.post('/tickets/hydrate', requireAdmin, hydrateTicketsHandler);
 apiRouter.post('/tickets/track-results', requireAdmin, trackTicketsResults);
+apiRouter.post('/tickets/retry-results', requireAdmin, retryFailedResultChecksHandler);
 apiRouter.post('/scheduler/results-run', requireAdmin, trackTicketsResults);
 
 apiRouter.get('/admin/overview', requireAdmin, getAdminOverview);

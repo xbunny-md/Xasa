@@ -4,20 +4,25 @@ import type {
   BetslipSelection,
   BetslipValidationResponse,
   BookmakerCatalogInfo,
+  BookmakerFeedState,
   BookmakerId,
   BookingCodeResponse,
   CanonicalMarketId,
   CanonicalMarketInfo,
+  CycleUnfinishedMatchInfo,
   DailyFactoryConfig,
   DiagnosticCheck,
   GeneratedTicket,
+  GenerationCycle,
   LeagueDirectoryItem,
   ManagedUserAccessRecord,
   MarketCatalogItem,
+  MatchResultRecord,
   NormalizedMatch,
   PerformanceAnalyticsSummary,
   PlatformSettings,
   ResearchReport,
+  ResultVerificationFailure,
   ScannerConfig,
   ScanResult,
   SchedulerStatus,
@@ -221,16 +226,26 @@ export const apiClient = {
     apiFetch<{ ticket: GeneratedTicket }>(
       `/api/tickets/${encodeURIComponent(internalTicketId)}`
     ),
-  getPerformanceAnalytics: () =>
-    apiFetch<PerformanceAnalyticsSummary>('/api/analytics/performance'),
-  getSchedulerStatus: () =>
-    apiFetch<{ status: SchedulerStatus }>('/api/scheduler/status'),
+  getPerformanceAnalytics: (bookmaker?: BookmakerId) =>
+    apiFetch<PerformanceAnalyticsSummary>(withBookmaker('/api/analytics/performance', bookmaker)),
+  getSchedulerStatus: (bookmaker?: BookmakerId) =>
+    apiFetch<{
+      status: SchedulerStatus;
+      feedStates?: Record<BookmakerId, BookmakerFeedState>;
+      feedCycles?: GenerationCycle[];
+      matchResults?: MatchResultRecord[];
+      verificationFailures?: ResultVerificationFailure[];
+    }>(withBookmaker('/api/scheduler/status', bookmaker)),
 
   // Administrator Control Center Endpoints (Bearer ID Token Protected)
   getDailyFactoryAdminState: (token: string) =>
     apiFetch<{
       config: DailyFactoryConfig;
       status: SchedulerStatus;
+      feedStates?: Record<BookmakerId, BookmakerFeedState>;
+      feedCycles?: GenerationCycle[];
+      unfinishedMatches?: CycleUnfinishedMatchInfo[];
+      verificationFailures?: ResultVerificationFailure[];
       logs: AutomationJobLog[];
     }>('/api/factory/config', undefined, token),
   updateDailyFactoryConfig: (config: DailyFactoryConfig, token: string) =>
@@ -262,15 +277,24 @@ export const apiClient = {
       },
       token
     ),
-  runDailyFactoryNow: (token: string) =>
+  runDailyFactoryNow: (token: string, bookmaker?: BookmakerId) =>
     apiFetch<{
       tickets: GeneratedTicket[];
       newTickets: GeneratedTicket[];
       log: AutomationJobLog;
       shortfallReason: string | null;
       status: SchedulerStatus;
+      feedStates?: Record<BookmakerId, BookmakerFeedState>;
+      feedCycles?: GenerationCycle[];
       logs: AutomationJobLog[];
-    }>('/api/factory/run', { method: 'POST' }, token),
+    }>(
+      '/api/factory/run',
+      {
+        method: 'POST',
+        body: JSON.stringify(bookmaker ? { bookmaker } : {}),
+      },
+      token
+    ),
   deleteTicket: (internalTicketId: string, token: string) =>
     apiFetch<{ deleted: boolean; internalTicketId: string }>(
       `/api/tickets/${encodeURIComponent(internalTicketId)}`,
@@ -300,32 +324,61 @@ export const apiClient = {
       },
       token
     ),
-  trackTicketsResults: (token: string, ticketIds?: string[]) =>
+  trackTicketsResults: (token: string, ticketIds?: string[], bookmaker?: BookmakerId) =>
     apiFetch<{
       updatedTickets: GeneratedTicket[];
       replenishedTickets?: GeneratedTicket[];
       log: AutomationJobLog;
       status: SchedulerStatus;
+      feedStates?: Record<BookmakerId, BookmakerFeedState>;
+      feedCycles?: GenerationCycle[];
       tickets: GeneratedTicket[];
       logs: AutomationJobLog[];
     }>(
       '/api/tickets/track-results',
       {
         method: 'POST',
-        body: JSON.stringify({ ticketIds }),
+        body: JSON.stringify({ ticketIds, bookmaker }),
       },
       token
     ),
-  hydrateTickets: (tickets: GeneratedTicket[], token: string) =>
+  retryFailedResultChecks: (token: string, bookmaker?: BookmakerId) =>
+    apiFetch<{
+      updatedTickets: GeneratedTicket[];
+      log: AutomationJobLog;
+      status: SchedulerStatus;
+      feedStates?: Record<BookmakerId, BookmakerFeedState>;
+      feedCycles?: GenerationCycle[];
+      tickets: GeneratedTicket[];
+      logs: AutomationJobLog[];
+    }>(
+      '/api/tickets/retry-results',
+      {
+        method: 'POST',
+        body: JSON.stringify({ bookmaker }),
+      },
+      token
+    ),
+  hydrateTickets: (
+    tickets: GeneratedTicket[],
+    token: string,
+    extra?: { cycles?: GenerationCycle[]; feedStates?: Partial<Record<BookmakerId, BookmakerFeedState>> }
+  ) =>
     apiFetch<{
       hydratedCount: number;
       totalTickets: number;
       status: SchedulerStatus;
+      feedStates?: Record<BookmakerId, BookmakerFeedState>;
+      feedCycles?: GenerationCycle[];
     }>(
       '/api/tickets/hydrate',
       {
         method: 'POST',
-        body: JSON.stringify({ tickets }),
+        body: JSON.stringify({
+          tickets,
+          cycles: extra?.cycles,
+          feedStates: extra?.feedStates,
+        }),
       },
       token
     ),

@@ -104,6 +104,9 @@ export const dailyFactoryConfigSchema = z
 
 export const hydrateTicketsSchema = z.object({
   tickets: z.array(z.record(z.string(), z.unknown())).max(600),
+  cycles: z.array(z.record(z.string(), z.unknown())).max(200).optional(),
+  feedStates: z.record(z.string(), z.unknown()).optional(),
+  matchResults: z.array(z.record(z.string(), z.unknown())).max(600).optional(),
 });
 
 export const transferDirectionEnum = z.enum(['SPORTYBET_TO_BETPAWA', 'BETPAWA_TO_SPORTYBET']);

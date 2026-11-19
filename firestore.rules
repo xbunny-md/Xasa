@@ -269,6 +269,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'isPublic', 'publishedByUid', 'internalTicketId', 'signature', 'bookmakerId',
+          'cycleId', 'idempotencyKey',
           'feedSection', 'sportId', 'sportName', 'replacedTicketId',
           'sourceType', 'categoryId', 'categoryLabel', 'targetOdds', 'actualCombinedOdds',
           'selectionCount', 'kickoffStartMs', 'kickoffEndMs', 'dataSource',
@@ -280,6 +281,8 @@ service cloud.firestore {
         && isValidId(data.internalTicketId) && data.internalTicketId.size() >= 3 && data.internalTicketId.size() <= 64
         && isValidString(data.signature, 4, 160)
         && (!data.keys().hasAny(['bookmakerId']) || data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ'])
+        && (!data.keys().hasAny(['cycleId']) || isValidString(data.cycleId, 1, 80))
+        && (!data.keys().hasAny(['idempotencyKey']) || isValidString(data.idempotencyKey, 1, 160))
         && (!data.keys().hasAny(['feedSection']) || data.feedSection in ['UPCOMING', 'LIVE_FOOTBALL', 'OTHER_SPORTS'])
         && (!data.keys().hasAny(['sportId']) || isValidString(data.sportId, 1, 40))
         && (!data.keys().hasAny(['sportName']) || isValidString(data.sportName, 1, 60))
@@ -306,14 +309,20 @@ service cloud.firestore {
           'bookingCodeError', 'selectionSettlements', 'settledAt', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'isPublic', 'internalTicketId', 'status', 'effectiveCombinedOdds',
+          'isPublic', 'internalTicketId', 'bookmakerId', 'cycleId', 'status',
+          'effectiveCombinedOdds', 'settledMatchCount', 'totalMatchCount', 'unfinishedMatchCount',
           'shareCode', 'shareUrl', 'shareCodeVerified', 'bookingCodeStatus',
           'bookingCodeError', 'selectionSettlements', 'settledAt', 'createdAt', 'updatedAt'
         ])
         && data.isPublic == true
         && isValidId(data.internalTicketId) && data.internalTicketId.size() >= 3 && data.internalTicketId.size() <= 64
+        && (!data.keys().hasAny(['bookmakerId']) || data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ'])
+        && (!data.keys().hasAny(['cycleId']) || isValidString(data.cycleId, 0, 80))
         && data.status in ['PENDING', 'LIVE', 'WON', 'LOST', 'VOID', 'PARTIALLY_SETTLED', 'UNVERIFIED']
         && data.effectiveCombinedOdds is number && data.effectiveCombinedOdds >= 1.0 && data.effectiveCombinedOdds <= 1000000
+        && (!data.keys().hasAny(['settledMatchCount']) || (data.settledMatchCount is number && data.settledMatchCount >= 0 && data.settledMatchCount <= 30))
+        && (!data.keys().hasAny(['totalMatchCount']) || (data.totalMatchCount is number && data.totalMatchCount >= 0 && data.totalMatchCount <= 30))
+        && (!data.keys().hasAny(['unfinishedMatchCount']) || (data.unfinishedMatchCount is number && data.unfinishedMatchCount >= 0 && data.unfinishedMatchCount <= 30))
         && isValidString(data.shareCode, 0, 32)
         && isValidString(data.shareUrl, 0, 300)
         && data.shareCodeVerified is bool
@@ -372,23 +381,127 @@ service cloud.firestore {
           'lastScanningAt', 'lastSettlementAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'isPublic', 'dailyTicketTarget', 'totalGeneratedToday', 'bookingCodesGeneratedToday',
+          'isPublic', 'bookmakerId', 'activeCycleId', 'generationLocked', 'lockStatus', 'lockReason',
+          'dailyTicketTarget', 'totalGeneratedToday', 'bookingCodesGeneratedToday',
           'liveFootballCount', 'otherSportsCount', 'upcomingActiveCount',
+          'unfinishedMatchesCount', 'unsettledTicketsCount',
           'settledWonCount', 'settledLostCount', 'settledVoidCount',
           'lastScanningAt', 'lastSettlementAt', 'updatedAt'
         ])
         && data.isPublic == true
+        && (!data.keys().hasAny(['bookmakerId']) || data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ'])
+        && (!data.keys().hasAny(['activeCycleId']) || isValidString(data.activeCycleId, 0, 80))
+        && (!data.keys().hasAny(['generationLocked']) || data.generationLocked is bool)
+        && (!data.keys().hasAny(['lockStatus']) || data.lockStatus in ['LOCKED', 'UNLOCKED'])
+        && (!data.keys().hasAny(['lockReason']) || isValidString(data.lockReason, 0, 300))
         && data.dailyTicketTarget is number && data.dailyTicketTarget >= 1 && data.dailyTicketTarget <= 200
         && data.totalGeneratedToday is number && data.totalGeneratedToday >= 0 && data.totalGeneratedToday <= 1000
         && data.bookingCodesGeneratedToday is number && data.bookingCodesGeneratedToday >= 0 && data.bookingCodesGeneratedToday <= 1000
         && (!data.keys().hasAny(['liveFootballCount']) || (data.liveFootballCount is number && data.liveFootballCount >= 0 && data.liveFootballCount <= 500))
         && (!data.keys().hasAny(['otherSportsCount']) || (data.otherSportsCount is number && data.otherSportsCount >= 0 && data.otherSportsCount <= 500))
         && (!data.keys().hasAny(['upcomingActiveCount']) || (data.upcomingActiveCount is number && data.upcomingActiveCount >= 0 && data.upcomingActiveCount <= 500))
+        && (!data.keys().hasAny(['unfinishedMatchesCount']) || (data.unfinishedMatchesCount is number && data.unfinishedMatchesCount >= 0 && data.unfinishedMatchesCount <= 5000))
+        && (!data.keys().hasAny(['unsettledTicketsCount']) || (data.unsettledTicketsCount is number && data.unsettledTicketsCount >= 0 && data.unsettledTicketsCount <= 5000))
         && (!data.keys().hasAny(['settledWonCount']) || (data.settledWonCount is number && data.settledWonCount >= 0 && data.settledWonCount <= 5000))
         && (!data.keys().hasAny(['settledLostCount']) || (data.settledLostCount is number && data.settledLostCount >= 0 && data.settledLostCount <= 5000))
         && (!data.keys().hasAny(['settledVoidCount']) || (data.settledVoidCount is number && data.settledVoidCount >= 0 && data.settledVoidCount <= 5000))
         && isValidString(data.lastScanningAt, 0, 40)
         && isValidString(data.lastSettlementAt, 0, 40)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBookmakerFeedState(data, bookmakerId) {
+      return data.keys().hasAll([
+          'isPublic', 'bookmakerId', 'bookmakerName', 'activeCycleId', 'generationLocked',
+          'lockStatus', 'lockReason', 'totalTicketsInCycle', 'settledTicketsInCycle',
+          'unsettledTicketsCount', 'totalMatchesInCycle', 'finishedMatchesCount',
+          'unfinishedMatchesCount', 'unverifiedMatchesCount', 'verificationFailuresCount',
+          'lastGenerationAt', 'lastResultCheckAt', 'lastUnlockedAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'isPublic', 'bookmakerId', 'bookmakerName', 'activeCycleId', 'generationLocked',
+          'lockStatus', 'lockReason', 'totalTicketsInCycle', 'settledTicketsInCycle',
+          'unsettledTicketsCount', 'totalMatchesInCycle', 'finishedMatchesCount',
+          'unfinishedMatchesCount', 'unverifiedMatchesCount', 'verificationFailuresCount',
+          'lastGenerationAt', 'lastResultCheckAt', 'lastUnlockedAt', 'updatedAt'
+        ])
+        && data.isPublic == true
+        && data.bookmakerId == bookmakerId
+        && data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ']
+        && isValidString(data.bookmakerName, 1, 80)
+        && isValidString(data.activeCycleId, 0, 80)
+        && data.generationLocked is bool
+        && data.lockStatus in ['LOCKED', 'UNLOCKED']
+        && isValidString(data.lockReason, 0, 300)
+        && data.totalTicketsInCycle is number && data.totalTicketsInCycle >= 0 && data.totalTicketsInCycle <= 1000
+        && data.settledTicketsInCycle is number && data.settledTicketsInCycle >= 0 && data.settledTicketsInCycle <= 1000
+        && data.unsettledTicketsCount is number && data.unsettledTicketsCount >= 0 && data.unsettledTicketsCount <= 1000
+        && data.totalMatchesInCycle is number && data.totalMatchesInCycle >= 0 && data.totalMatchesInCycle <= 10000
+        && data.finishedMatchesCount is number && data.finishedMatchesCount >= 0 && data.finishedMatchesCount <= 10000
+        && data.unfinishedMatchesCount is number && data.unfinishedMatchesCount >= 0 && data.unfinishedMatchesCount <= 10000
+        && data.unverifiedMatchesCount is number && data.unverifiedMatchesCount >= 0 && data.unverifiedMatchesCount <= 10000
+        && data.verificationFailuresCount is number && data.verificationFailuresCount >= 0 && data.verificationFailuresCount <= 10000
+        && isValidString(data.lastGenerationAt, 0, 40)
+        && isValidString(data.lastResultCheckAt, 0, 40)
+        && isValidString(data.lastUnlockedAt, 0, 40)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFeedCycle(data, cycleId) {
+      return data.keys().hasAll([
+          'isPublic', 'cycleId', 'idempotencyKey', 'bookmakerId', 'dateKey', 'status',
+          'generationLocked', 'ticketIds', 'ticketCount', 'totalMatches', 'finishedMatches',
+          'unfinishedMatches', 'wonTickets', 'lostTickets', 'voidTickets', 'settledAt',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'isPublic', 'cycleId', 'idempotencyKey', 'bookmakerId', 'dateKey', 'status',
+          'generationLocked', 'ticketIds', 'ticketCount', 'totalMatches', 'finishedMatches',
+          'unfinishedMatches', 'wonTickets', 'lostTickets', 'voidTickets', 'settledAt',
+          'createdAt', 'updatedAt'
+        ])
+        && data.isPublic == true
+        && data.cycleId == cycleId
+        && isValidId(data.cycleId) && data.cycleId.size() >= 3 && data.cycleId.size() <= 80
+        && isValidString(data.idempotencyKey, 3, 160)
+        && data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ']
+        && isValidString(data.dateKey, 8, 20)
+        && data.status in ['ACTIVE', 'SETTLED']
+        && data.generationLocked is bool
+        && isValidBoundedStringList(data.ticketIds, 200)
+        && data.ticketCount is number && data.ticketCount >= 0 && data.ticketCount <= 500
+        && data.totalMatches is number && data.totalMatches >= 0 && data.totalMatches <= 10000
+        && data.finishedMatches is number && data.finishedMatches >= 0 && data.finishedMatches <= 10000
+        && data.unfinishedMatches is number && data.unfinishedMatches >= 0 && data.unfinishedMatches <= 10000
+        && data.wonTickets is number && data.wonTickets >= 0 && data.wonTickets <= 500
+        && data.lostTickets is number && data.lostTickets >= 0 && data.lostTickets <= 500
+        && data.voidTickets is number && data.voidTickets >= 0 && data.voidTickets <= 500
+        && isValidString(data.settledAt, 0, 40)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMatchResult(data, resultId) {
+      return data.keys().hasAll([
+          'isPublic', 'resultId', 'bookmakerId', 'eventId', 'homeTeam', 'awayTeam',
+          'officialMatchStatus', 'status', 'score', 'verified', 'reason', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'isPublic', 'resultId', 'bookmakerId', 'eventId', 'homeTeam', 'awayTeam',
+          'officialMatchStatus', 'status', 'score', 'verified', 'reason', 'updatedAt'
+        ])
+        && data.isPublic == true
+        && data.resultId == resultId
+        && isValidId(data.resultId) && data.resultId.size() >= 3 && data.resultId.size() <= 128
+        && data.bookmakerId in ['SPORTYBET_TZ', 'BETPAWA_TZ']
+        && isValidString(data.eventId, 1, 100)
+        && isValidString(data.homeTeam, 1, 140)
+        && isValidString(data.awayTeam, 1, 140)
+        && isValidString(data.officialMatchStatus, 0, 80)
+        && data.status in ['UPCOMING', 'PENDING', 'LIVE', 'WON', 'LOST', 'VOID', 'POSTPONED', 'SUSPENDED', 'UNVERIFIED']
+        && isValidString(data.score, 0, 40)
+        && data.verified is bool
+        && isValidString(data.reason, 0, 300)
         && data.updatedAt is timestamp;
     }
 
@@ -426,7 +539,7 @@ service cloud.firestore {
 
     // Shared Public Daily Tickets (All Users Read, Admins Publish/Remove)
     match /publicTickets/{ticketId} {
-      allow get: if isValidId(ticketId) && resource.data.isPublic == true;
+      allow get: if isValidId(ticketId) && (isAdmin() || (resource != null && resource.data.isPublic == true));
       allow list: if resource.data.isPublic == true;
       allow create: if isValidId(ticketId)
         && isAdmin()
@@ -438,7 +551,7 @@ service cloud.firestore {
 
     // Separate Mutable Settlement & Booking Code Updates for Public Tickets
     match /publicTicketUpdates/{ticketId} {
-      allow get: if isValidId(ticketId) && resource.data.isPublic == true;
+      allow get: if isValidId(ticketId) && (isAdmin() || (resource != null && resource.data.isPublic == true));
       allow list: if resource.data.isPublic == true;
       allow create: if isValidId(ticketId)
         && isAdmin()
@@ -451,22 +564,86 @@ service cloud.firestore {
         && incoming().internalTicketId == existing().internalTicketId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && !(existing().status in ['WON', 'LOST', 'VOID'])
+        && (
+          !(existing().status in ['WON', 'LOST', 'VOID'])
+          || (
+            existing().status == 'LOST'
+            && existing().keys().hasAny(['unfinishedMatchCount'])
+            && existing().unfinishedMatchCount > 0
+            && incoming().status == existing().status
+            && incoming().effectiveCombinedOdds == existing().effectiveCombinedOdds
+            && incoming().settledAt == existing().settledAt
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'selectionSettlements', 'settledMatchCount', 'totalMatchCount', 'unfinishedMatchCount', 'updatedAt'
+            ])
+          )
+        )
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'status', 'effectiveCombinedOdds', 'shareCode', 'shareUrl',
-          'shareCodeVerified', 'bookingCodeStatus', 'bookingCodeError',
-          'selectionSettlements', 'settledAt', 'updatedAt'
+          'bookmakerId', 'cycleId', 'status', 'effectiveCombinedOdds',
+          'settledMatchCount', 'totalMatchCount', 'unfinishedMatchCount',
+          'shareCode', 'shareUrl', 'shareCodeVerified', 'bookingCodeStatus',
+          'bookingCodeError', 'selectionSettlements', 'settledAt', 'updatedAt'
         ]);
       allow delete: if isValidId(ticketId) && isAdmin();
     }
 
     // Public Daily Factory Summary Stats
     match /publicStats/{statId} {
-      allow get: if isValidId(statId) && resource.data.isPublic == true;
+      allow get: if isValidId(statId) && (isAdmin() || resource == null || resource.data.isPublic == true);
       allow list: if resource.data.isPublic == true;
       allow create, update: if isValidId(statId)
         && isAdmin()
         && isValidPublicStats(incoming())
+        && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Independent Bookmaker Feed Lock State
+    match /bookmakerFeedStates/{bookmakerId} {
+      allow get: if isValidId(bookmakerId) && (isAdmin() || (resource != null && resource.data.isPublic == true));
+      allow list: if resource.data.isPublic == true;
+      allow create, update: if isValidId(bookmakerId)
+        && isAdmin()
+        && isValidBookmakerFeedState(incoming(), bookmakerId)
+        && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Permanent Daily Generation Cycles Scoped per Bookmaker
+    match /feedCycles/{cycleId} {
+      allow get: if isValidId(cycleId) && (isAdmin() || (resource != null && resource.data.isPublic == true));
+      allow list: if resource.data.isPublic == true;
+      allow create: if isValidId(cycleId)
+        && isAdmin()
+        && isValidFeedCycle(incoming(), cycleId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(cycleId)
+        && isAdmin()
+        && isValidFeedCycle(incoming(), cycleId)
+        && incoming().cycleId == existing().cycleId
+        && incoming().idempotencyKey == existing().idempotencyKey
+        && incoming().bookmakerId == existing().bookmakerId
+        && incoming().dateKey == existing().dateKey
+        && incoming().ticketIds == existing().ticketIds
+        && incoming().ticketCount == existing().ticketCount
+        && incoming().createdAt == existing().createdAt
+        && existing().status != 'SETTLED'
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'generationLocked', 'finishedMatches', 'unfinishedMatches',
+          'wonTickets', 'lostTickets', 'voidTickets', 'settledAt', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // Verified Match Result Records Scoped per Bookmaker Event
+    match /matchResults/{resultId} {
+      allow get: if isValidId(resultId) && (isAdmin() || (resource != null && resource.data.isPublic == true));
+      allow list: if resource.data.isPublic == true;
+      allow create, update: if isValidId(resultId)
+        && isAdmin()
+        && isValidMatchResult(incoming(), resultId)
         && incoming().updatedAt == request.time;
       allow delete: if false;
     }

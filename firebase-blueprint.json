@@ -272,6 +272,8 @@
         },
         "signature": { "type": "string", "minLength": 4, "maxLength": 160 },
         "bookmakerId": { "type": "string", "enum": ["SPORTYBET_TZ", "BETPAWA_TZ"] },
+        "cycleId": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 160 },
         "feedSection": { "type": "string", "enum": ["UPCOMING", "LIVE_FOOTBALL", "OTHER_SPORTS"] },
         "sportId": { "type": "string", "minLength": 1, "maxLength": 40 },
         "sportName": { "type": "string", "minLength": 1, "maxLength": 60 },
@@ -310,7 +312,7 @@
     },
     "PublicTicketUpdateRecord": {
       "title": "PublicTicketUpdateRecord",
-      "description": "Mutable settlement updates and verified SportyBet sharing code linkage for public daily tickets.",
+      "description": "Mutable settlement updates and verified bookmaker sharing code linkage for public daily tickets.",
       "type": "object",
       "properties": {
         "isPublic": { "type": "boolean" },
@@ -320,11 +322,16 @@
           "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
+        "bookmakerId": { "type": "string", "enum": ["SPORTYBET_TZ", "BETPAWA_TZ"] },
+        "cycleId": { "type": "string", "maxLength": 80 },
         "status": {
           "type": "string",
           "enum": ["PENDING", "LIVE", "WON", "LOST", "VOID", "PARTIALLY_SETTLED", "UNVERIFIED"]
         },
         "effectiveCombinedOdds": { "type": "number" },
+        "settledMatchCount": { "type": "number" },
+        "totalMatchCount": { "type": "number" },
+        "unfinishedMatchCount": { "type": "number" },
         "shareCode": { "type": "string", "maxLength": 32 },
         "shareUrl": { "type": "string", "maxLength": 300 },
         "shareCodeVerified": { "type": "boolean" },
@@ -411,12 +418,19 @@
       "type": "object",
       "properties": {
         "isPublic": { "type": "boolean" },
+        "bookmakerId": { "type": "string", "enum": ["SPORTYBET_TZ", "BETPAWA_TZ"] },
+        "activeCycleId": { "type": "string", "maxLength": 80 },
+        "generationLocked": { "type": "boolean" },
+        "lockStatus": { "type": "string", "enum": ["LOCKED", "UNLOCKED"] },
+        "lockReason": { "type": "string", "maxLength": 300 },
         "dailyTicketTarget": { "type": "number" },
         "totalGeneratedToday": { "type": "number" },
         "bookingCodesGeneratedToday": { "type": "number" },
         "liveFootballCount": { "type": "number" },
         "otherSportsCount": { "type": "number" },
         "upcomingActiveCount": { "type": "number" },
+        "unfinishedMatchesCount": { "type": "number" },
+        "unsettledTicketsCount": { "type": "number" },
         "settledWonCount": { "type": "number" },
         "settledLostCount": { "type": "number" },
         "settledVoidCount": { "type": "number" },
@@ -431,6 +445,144 @@
         "bookingCodesGeneratedToday",
         "lastScanningAt",
         "lastSettlementAt",
+        "updatedAt"
+      ]
+    },
+    "BookmakerFeedStateRecord": {
+      "title": "BookmakerFeedStateRecord",
+      "description": "Independent generation lock state and active cycle tracker scoped per bookmaker.",
+      "type": "object",
+      "properties": {
+        "isPublic": { "type": "boolean" },
+        "bookmakerId": { "type": "string", "enum": ["SPORTYBET_TZ", "BETPAWA_TZ"] },
+        "bookmakerName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "activeCycleId": { "type": "string", "maxLength": 80 },
+        "generationLocked": { "type": "boolean" },
+        "lockStatus": { "type": "string", "enum": ["LOCKED", "UNLOCKED"] },
+        "lockReason": { "type": "string", "maxLength": 300 },
+        "totalTicketsInCycle": { "type": "number" },
+        "settledTicketsInCycle": { "type": "number" },
+        "unsettledTicketsCount": { "type": "number" },
+        "totalMatchesInCycle": { "type": "number" },
+        "finishedMatchesCount": { "type": "number" },
+        "unfinishedMatchesCount": { "type": "number" },
+        "unverifiedMatchesCount": { "type": "number" },
+        "verificationFailuresCount": { "type": "number" },
+        "lastGenerationAt": { "type": "string", "maxLength": 40 },
+        "lastResultCheckAt": { "type": "string", "maxLength": 40 },
+        "lastUnlockedAt": { "type": "string", "maxLength": 40 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "isPublic",
+        "bookmakerId",
+        "bookmakerName",
+        "activeCycleId",
+        "generationLocked",
+        "lockStatus",
+        "lockReason",
+        "totalTicketsInCycle",
+        "settledTicketsInCycle",
+        "unsettledTicketsCount",
+        "totalMatchesInCycle",
+        "finishedMatchesCount",
+        "unfinishedMatchesCount",
+        "unverifiedMatchesCount",
+        "verificationFailuresCount",
+        "lastGenerationAt",
+        "lastResultCheckAt",
+        "lastUnlockedAt",
+        "updatedAt"
+      ]
+    },
+    "FeedCycleRecord": {
+      "title": "FeedCycleRecord",
+      "description": "Immutable-membership daily generation cycle record with idempotency key per bookmaker.",
+      "type": "object",
+      "properties": {
+        "isPublic": { "type": "boolean" },
+        "cycleId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "idempotencyKey": { "type": "string", "minLength": 3, "maxLength": 160 },
+        "bookmakerId": { "type": "string", "enum": ["SPORTYBET_TZ", "BETPAWA_TZ"] },
+        "dateKey": { "type": "string", "minLength": 8, "maxLength": 20 },
+        "status": { "type": "string", "enum": ["ACTIVE", "SETTLED"] },
+        "generationLocked": { "type": "boolean" },
+        "ticketIds": { "type": "array" },
+        "ticketCount": { "type": "number" },
+        "totalMatches": { "type": "number" },
+        "finishedMatches": { "type": "number" },
+        "unfinishedMatches": { "type": "number" },
+        "wonTickets": { "type": "number" },
+        "lostTickets": { "type": "number" },
+        "voidTickets": { "type": "number" },
+        "settledAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "isPublic",
+        "cycleId",
+        "idempotencyKey",
+        "bookmakerId",
+        "dateKey",
+        "status",
+        "generationLocked",
+        "ticketIds",
+        "ticketCount",
+        "totalMatches",
+        "finishedMatches",
+        "unfinishedMatches",
+        "wonTickets",
+        "lostTickets",
+        "voidTickets",
+        "settledAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MatchResultRecord": {
+      "title": "MatchResultRecord",
+      "description": "Verified match result record tracked per bookmaker event.",
+      "type": "object",
+      "properties": {
+        "isPublic": { "type": "boolean" },
+        "resultId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bookmakerId": { "type": "string", "enum": ["SPORTYBET_TZ", "BETPAWA_TZ"] },
+        "eventId": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "homeTeam": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "awayTeam": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "officialMatchStatus": { "type": "string", "maxLength": 80 },
+        "status": {
+          "type": "string",
+          "enum": ["UPCOMING", "PENDING", "LIVE", "WON", "LOST", "VOID", "POSTPONED", "SUSPENDED", "UNVERIFIED"]
+        },
+        "score": { "type": "string", "maxLength": 40 },
+        "verified": { "type": "boolean" },
+        "reason": { "type": "string", "maxLength": 300 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "isPublic",
+        "resultId",
+        "bookmakerId",
+        "eventId",
+        "homeTeam",
+        "awayTeam",
+        "officialMatchStatus",
+        "status",
+        "score",
+        "verified",
+        "reason",
         "updatedAt"
       ]
     },
@@ -588,6 +740,18 @@
     "/adminAuditLogs/{logId}": {
       "schema": { "$ref": "#/entities/AdminAuditLogRecord" },
       "description": "Immutable administrator audit and automation execution logs."
+    },
+    "/bookmakerFeedStates/{bookmakerId}": {
+      "schema": { "$ref": "#/entities/BookmakerFeedStateRecord" },
+      "description": "Independent generation lock state and active cycle tracker per bookmaker."
+    },
+    "/feedCycles/{cycleId}": {
+      "schema": { "$ref": "#/entities/FeedCycleRecord" },
+      "description": "Permanent daily generation cycle records scoped per bookmaker with idempotency keys."
+    },
+    "/matchResults/{resultId}": {
+      "schema": { "$ref": "#/entities/MatchResultRecord" },
+      "description": "Verified match result records tracked per bookmaker event."
     }
   }
 }

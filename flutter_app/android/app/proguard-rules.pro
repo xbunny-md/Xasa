@@ -1,0 +1,4 @@
+-keep class com.odyx.app.** { *; }
+-keepattributes *Annotation*
+-dontwarn okhttp3.**
+-dontwarn okio.**

@@ -32,6 +32,9 @@ const LEG_STATUS_STYLE: Record<SelectionSettlementStatus, string> = {
   VOID: 'text-slate-700 bg-slate-100 border-slate-200 dark:text-slate-300 dark:bg-slate-500/10 dark:border-slate-500/30',
   LIVE: 'text-amber-700 bg-amber-50 border-amber-200 dark:text-amber-300 dark:bg-amber-500/10 dark:border-amber-500/30',
   UNVERIFIED: 'text-orange-700 bg-orange-50 border-orange-200 dark:text-orange-300 dark:bg-orange-500/10 dark:border-orange-500/30',
+  POSTPONED: 'text-purple-700 bg-purple-50 border-purple-200 dark:text-purple-300 dark:bg-purple-500/10 dark:border-purple-500/30',
+  SUSPENDED: 'text-yellow-700 bg-yellow-50 border-yellow-200 dark:text-yellow-300 dark:bg-yellow-500/10 dark:border-yellow-500/30',
+  UPCOMING: 'text-sky-700 bg-sky-50 border-sky-200 dark:text-sky-300 dark:bg-sky-500/10 dark:border-sky-500/30',
   PENDING: 'text-blue-700 bg-blue-50 border-blue-200 dark:text-blue-300 dark:bg-blue-500/10 dark:border-blue-500/30',
 };
 
@@ -221,7 +224,9 @@ export function TicketDetailsPage() {
                   : selectedTicket.feedSection === 'OTHER_SPORTS'
                     ? selectedTicket.sportName || 'Other Games'
                     : 'Upcoming Football'}{' '}
-                · {selectedTicket.categoryLabel} · {selectedTicket.internalTicketId}
+                · {selectedTicket.categoryLabel}
+                {selectedTicket.cycleId ? ` · Cycle ${selectedTicket.cycleId}` : ''} ·{' '}
+                {selectedTicket.internalTicketId}
               </span>
               <h2 className="text-2xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">
                 {selectedTicket.actualCombinedOdds.toFixed(2)} Combined Odds
@@ -238,7 +243,7 @@ export function TicketDetailsPage() {
                   onClick={() => openTicketDetails(selectedTicket.replacedTicketId!)}
                   className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-mono text-cyan-700 dark:text-cyan-300 hover:underline"
                 >
-                  Auto-replenished after ended ticket #{selectedTicket.replacedTicketId}
+                  Linked predecessor ticket #{selectedTicket.replacedTicketId}
                 </button>
               )}
             </div>
@@ -258,7 +263,7 @@ export function TicketDetailsPage() {
                 selectedTicket.status === 'LOST' ||
                 selectedTicket.status === 'VOID') && (
                 <span className="block text-[10px] font-mono text-slate-500 dark:text-slate-400 mt-0.5">
-                  Locked in Firebase
+                  Permanent Result in Firebase
                 </span>
               )}
             </div>
@@ -267,10 +272,14 @@ export function TicketDetailsPage() {
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
             <div className="p-3 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.06]">
               <span className="block text-[10px] uppercase tracking-wider text-slate-500">
-                Selections
+                Match Progress
               </span>
               <span className="font-mono text-base font-semibold text-slate-900 dark:text-white tabular-nums mt-0.5 block">
-                {selectedTicket.selectionCount} Legs
+                {selectedTicket.settledMatchCount ??
+                  selectedTicket.selectionSettlements.filter(
+                    (s) => s.status === 'WON' || s.status === 'LOST' || s.status === 'VOID'
+                  ).length}
+                /{selectedTicket.selectionCount} Settled
               </span>
             </div>
             <div className="p-3 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.06]">
@@ -422,7 +431,8 @@ export function TicketDetailsPage() {
             <tbody className="divide-y divide-slate-100 dark:divide-white/[0.06]">
               {visibleSelections.map((sel, index) => {
                 const st = settlementByKey.get(sel.selectionKey);
-                const legStatus: SelectionSettlementStatus = st?.status || 'PENDING';
+                const legStatus: SelectionSettlementStatus =
+                  st?.status || (sel.isLive ? 'LIVE' : 'UPCOMING');
                 return (
                   <tr
                     key={sel.selectionKey}

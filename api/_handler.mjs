@@ -401,6 +401,19 @@ async function verifyIdTokenWithAdmin(idToken) {
     return null;
   }
 }
+function getAdminFirestoreIfConfigured() {
+  if (!hasServiceAccountCredentials()) return null;
+  try {
+    const app2 = getFirebaseAdminApp();
+    const dbId = FIREBASE_CONFIG_META.firestoreDatabaseId;
+    if (dbId && dbId !== "(default)") {
+      return getFirestore(app2, dbId);
+    }
+    return getFirestore(app2);
+  } catch {
+    return null;
+  }
+}
 function getFirebaseProjectMeta() {
   return {
     projectId: FIREBASE_CONFIG_META.projectId,
@@ -2018,7 +2031,10 @@ var dailyFactoryConfigSchema = z.object({
   path: ["maxSelections"]
 });
 var hydrateTicketsSchema = z.object({
-  tickets: z.array(z.record(z.string(), z.unknown())).max(600)
+  tickets: z.array(z.record(z.string(), z.unknown())).max(600),
+  cycles: z.array(z.record(z.string(), z.unknown())).max(200).optional(),
+  feedStates: z.record(z.string(), z.unknown()).optional(),
+  matchResults: z.array(z.record(z.string(), z.unknown())).max(600).optional()
 });
 var transferDirectionEnum = z.enum(["SPORTYBET_TO_BETPAWA", "BETPAWA_TO_SPORTYBET"]);
 var transferSourceSelectionSchema = z.object({
@@ -2671,10 +2687,14 @@ function generateDailyPortfolioFromMatches(params) {
   const targetCount = Math.max(1, Math.min(200, params.targetCount));
   const existingSignatures = new Set(params.existingSignatures || []);
   const activeBookmaker = normalizeBookmakerId(
-    matches[0]?.bookmakerId || config.activeBookmaker
+    params.bookmakerId || matches[0]?.bookmakerId || config.activeBookmaker
   );
   const bookmakerInfo = getBookmakerInfo(activeBookmaker);
-  const candidates = discoverEligibleSelections(matches, config, nowMs, {
+  const scopedConfig = {
+    ...config,
+    activeBookmaker
+  };
+  const candidates = discoverEligibleSelections(matches, scopedConfig, nowMs, {
     allowLive: params.allowLive,
     allowBothLiveAndUpcoming: params.allowBothLiveAndUpcoming,
     ignoreScheduleWindow: params.ignoreScheduleWindow,
@@ -2767,6 +2787,8 @@ function generateDailyPortfolioFromMatches(params) {
       bookmakerId: activeBookmaker,
       bookmakerName: bookmakerInfo.name,
       bookmakerUrl: bookmakerInfo.websiteUrl,
+      cycleId: params.cycleId,
+      idempotencyKey: params.idempotencyKey,
       feedSection,
       sportId: ticketSportId,
       sportName: ticketSportName,
@@ -2788,16 +2810,19 @@ function generateDailyPortfolioFromMatches(params) {
       revalidatedAt: generatedAt,
       status: picks.some((p) => p.isLive) ? "LIVE" : "PENDING",
       effectiveCombinedOdds: actualCombinedOdds,
+      settledMatchCount: 0,
+      totalMatchCount: picks.length,
+      unfinishedMatchCount: picks.length,
       selectionSettlements: picks.map((p) => ({
         selectionKey: p.selectionKey,
         eventId: p.eventId,
-        status: p.isLive ? "LIVE" : "PENDING",
+        status: p.isLive ? "LIVE" : "UPCOMING",
         officialMatchStatus: p.matchStatus,
         score: null,
         playedSeconds: null,
         currentOdds: p.odds,
         oddsChanged: false,
-        reason: p.isLive ? "Live In-Play selection" : "Awaiting kickoff",
+        reason: p.isLive ? "Live In-Play selection" : "Scheduled upcoming kickoff",
         checkedAt: generatedAt
       })),
       shareCode: null,
@@ -2875,8 +2900,8 @@ function generateDailyPortfolioFromMatches(params) {
     shortfallReason
   };
 }
-async function fetchUpcomingMatchesForFactory(config) {
-  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+async function fetchUpcomingMatchesForFactory(config, bookmakerIdOverride) {
+  const bookmakerId = normalizeBookmakerId(bookmakerIdOverride || config.activeBookmaker);
   const client = getBookmakerClient(bookmakerId);
   const allCatalogMarkets = getBookmakerMarketCatalog(bookmakerId).filter((m) => !isDisallowedDailyFeedMarket(m.id, m.name)).map((m) => m.id);
   const effectiveMarkets = resolveEffectiveMarketsForBookmaker(
@@ -2907,8 +2932,8 @@ async function fetchUpcomingMatchesForFactory(config) {
   }
   return allMatches;
 }
-async function fetchLiveFootballMatchesForFactory(config) {
-  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+async function fetchLiveFootballMatchesForFactory(config, bookmakerIdOverride) {
+  const bookmakerId = normalizeBookmakerId(bookmakerIdOverride || config.activeBookmaker);
   const client = getBookmakerClient(bookmakerId);
   const summaryLive = await client.getLiveMatches("sr:sport:1").catch(() => []);
   if (summaryLive.length === 0) return [];
@@ -2939,8 +2964,8 @@ async function fetchLiveFootballMatchesForFactory(config) {
   }
   return enriched;
 }
-async function fetchOtherSportsMatchesForFactory(config) {
-  const bookmakerId = normalizeBookmakerId(config.activeBookmaker);
+async function fetchOtherSportsMatchesForFactory(config, bookmakerIdOverride) {
+  const bookmakerId = normalizeBookmakerId(bookmakerIdOverride || config.activeBookmaker);
   const client = getBookmakerClient(bookmakerId);
   if (bookmakerId === "BETPAWA_TZ") {
     return [];
@@ -2997,6 +3022,675 @@ async function fetchOtherSportsMatchesForFactory(config) {
   return allOtherMatches;
 }
 
+// backend/services/settlementService.ts
+function isSelectionTerminalStatus(status) {
+  return status === "WON" || status === "LOST" || status === "VOID";
+}
+function isTicketTerminalStatus(status) {
+  return status === "WON" || status === "LOST" || status === "VOID";
+}
+function parseScoreString(score) {
+  if (!score) return null;
+  const m = /(\d+)\s*[:\-]\s*(\d+)/.exec(String(score).trim());
+  if (!m) return null;
+  const homeGoals = Number(m[1]);
+  const awayGoals = Number(m[2]);
+  if (!Number.isInteger(homeGoals) || !Number.isInteger(awayGoals)) return null;
+  if (homeGoals < 0 || awayGoals < 0) return null;
+  return { homeGoals, awayGoals };
+}
+function isMatchOfficiallyVoided(matchStatus, statusCode) {
+  if (statusCode === 5 || statusCode === 7) return true;
+  return /\b(cancelled|canceled|abandoned|walkover|void|voided)\b/i.test(matchStatus || "");
+}
+function isMatchPostponed(matchStatus, statusCode) {
+  if (statusCode === 6) return true;
+  return /\b(postponed|interrupted|delayed|rescheduled)\b/i.test(matchStatus || "");
+}
+function isMatchSuspended(matchStatus) {
+  return /\bsuspended\b/i.test(matchStatus || "");
+}
+function isMatchEnded(matchStatus, statusCode) {
+  if (statusCode === 3 || statusCode === 4) return true;
+  return /\b(ended|ft|finished|full\s*time|aet|ap|closed)\b/i.test(matchStatus || "");
+}
+function isMatchLiveStatus(match) {
+  if (match.isLive || match.statusCode === 1) return true;
+  return /\b(h1|h2|ht|live|1st\s*half|2nd\s*half|extra\s*time|halftime|break)\b/i.test(
+    match.matchStatus || ""
+  );
+}
+function settleSingleSelectionOutcome(sel, score) {
+  const { homeGoals, awayGoals } = score;
+  const totalGoals = homeGoals + awayGoals;
+  const marketId = String(sel.marketId).trim();
+  const outcomeId = String(sel.outcomeId).trim();
+  const desc = (sel.outcomeDesc || "").trim().toLowerCase();
+  const spec = (sel.specifier || "").trim().toLowerCase();
+  if (marketId === "1" || marketId === "3743") {
+    if (outcomeId === "1" || desc === "home" || desc === "1") {
+      return {
+        status: homeGoals > awayGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (Home)`
+      };
+    }
+    if (outcomeId === "2" || desc === "draw" || desc === "x") {
+      return {
+        status: homeGoals === awayGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (Draw)`
+      };
+    }
+    if (outcomeId === "3" || desc === "away" || desc === "2") {
+      return {
+        status: awayGoals > homeGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (Away)`
+      };
+    }
+  }
+  if (marketId === "10" || marketId === "4693") {
+    if (outcomeId === "9" || /\b1x\b|home.*draw/i.test(desc)) {
+      return {
+        status: homeGoals >= awayGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (1X)`
+      };
+    }
+    if (outcomeId === "10" || /\b12\b|home.*away/i.test(desc)) {
+      return {
+        status: homeGoals !== awayGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (12)`
+      };
+    }
+    if (outcomeId === "11" || /\bx2\b|draw.*away/i.test(desc)) {
+      return {
+        status: awayGoals >= homeGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (X2)`
+      };
+    }
+  }
+  if (marketId === "18" || marketId === "5000" || marketId === "225" || marketId === "238" || marketId === "236" || marketId === "189") {
+    const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
+    const descMatch = /(over|under)\s*(\d+(?:\.\d+)?)/i.exec(desc);
+    const line = specMatch ? Number(specMatch[1]) : descMatch ? Number(descMatch[2]) : NaN;
+    const isOver = outcomeId === "12" || /\bover\b/i.test(desc);
+    const isUnder = outcomeId === "13" || /\bunder\b/i.test(desc);
+    if (Number.isFinite(line) && (isOver || isUnder)) {
+      const sportId = sel.sportId || "";
+      const isSetScoredSport = sportId === "sr:sport:5" || sportId === "sr:sport:20" || sportId === "sr:sport:23";
+      if (isSetScoredSport && line >= 12 && totalGoals <= 7) {
+        return {
+          status: "UNVERIFIED",
+          reason: `Set score ${homeGoals}:${awayGoals} cannot verify total points/games line ${line} \u2014 requires detailed point count.`
+        };
+      }
+      if (totalGoals === line) {
+        return {
+          status: "VOID",
+          reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} pushes line ${line})`
+        };
+      }
+      const won = isOver ? totalGoals > line : totalGoals < line;
+      return {
+        status: won ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} vs ${isOver ? "Over" : "Under"} ${line})`
+      };
+    }
+  }
+  if (marketId === "19" || marketId === "20" || marketId === "5006" || marketId === "5003") {
+    const teamGoals = marketId === "19" || marketId === "5006" ? homeGoals : awayGoals;
+    const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
+    const descMatch = /(over|under)\s*(\d+(?:\.\d+)?)/i.exec(desc);
+    const line = specMatch ? Number(specMatch[1]) : descMatch ? Number(descMatch[2]) : NaN;
+    const isOver = outcomeId === "12" || /\bover\b/i.test(desc);
+    const isUnder = outcomeId === "13" || /\bunder\b/i.test(desc);
+    if (Number.isFinite(line) && (isOver || isUnder)) {
+      if (teamGoals === line) {
+        return { status: "VOID", reason: `FT ${homeGoals}:${awayGoals} (Team total pushes ${line})` };
+      }
+      const won = isOver ? teamGoals > line : teamGoals < line;
+      return {
+        status: won ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (Team total ${teamGoals} vs ${isOver ? "Over" : "Under"} ${line})`
+      };
+    }
+  }
+  if (marketId === "29" || marketId === "3795") {
+    const bothScored = homeGoals > 0 && awayGoals > 0;
+    if (outcomeId === "74" || desc === "yes" || desc === "gg") {
+      return {
+        status: bothScored ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (BTTS Yes)`
+      };
+    }
+    if (outcomeId === "76" || desc === "no" || desc === "ng") {
+      return {
+        status: !bothScored ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (BTTS No)`
+      };
+    }
+  }
+  if (marketId === "11" || marketId === "4703") {
+    if (homeGoals === awayGoals) {
+      return {
+        status: "VOID",
+        reason: `FT ${homeGoals}:${awayGoals} (Draw No Bet voided on draw)`
+      };
+    }
+    if (outcomeId === "4" || /\bhome\b|\b1\b/i.test(desc)) {
+      return {
+        status: homeGoals > awayGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (DNB Home)`
+      };
+    }
+    if (outcomeId === "5" || /\baway\b|\b2\b/i.test(desc)) {
+      return {
+        status: awayGoals > homeGoals ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (DNB Away)`
+      };
+    }
+  }
+  if (marketId === "26" || marketId === "4833") {
+    const isOdd = totalGoals % 2 === 1;
+    if (outcomeId === "70" || /\bodd\b/i.test(desc)) {
+      return {
+        status: isOdd ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} ${isOdd ? "Odd" : "Even"})`
+      };
+    }
+    if (outcomeId === "72" || /\beven\b/i.test(desc)) {
+      return {
+        status: !isOdd ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} ${isOdd ? "Odd" : "Even"})`
+      };
+    }
+  }
+  if (marketId === "16" || marketId === "3774") {
+    const hcpSpec = /hcp=([+-]?\d+(?:\.\d+)?)/.exec(spec);
+    if (hcpSpec) {
+      const hcp = Number(hcpSpec[1]);
+      const isHome = outcomeId === "1714" || /\bhome\b|\b1\b/i.test(desc);
+      const isAway = outcomeId === "1715" || /\baway\b|\b2\b/i.test(desc);
+      if (isHome || isAway) {
+        const diff = isHome ? homeGoals + hcp - awayGoals : awayGoals - hcp - homeGoals;
+        if (Math.abs(diff) < 1e-9) {
+          return {
+            status: "VOID",
+            reason: `FT ${homeGoals}:${awayGoals} (Asian Handicap push)`
+          };
+        }
+        return {
+          status: diff > 0 ? "WON" : "LOST",
+          reason: `FT ${homeGoals}:${awayGoals} (AH ${hcp})`
+        };
+      }
+    }
+  }
+  if (marketId === "14") {
+    const hcpSpec = /hcp=(\d+)\s*:\s*(\d+)/.exec(spec);
+    if (hcpSpec) {
+      const adjHome = homeGoals + Number(hcpSpec[1]);
+      const adjAway = awayGoals + Number(hcpSpec[2]);
+      if (/\bhome\b|\b1\b/i.test(desc)) {
+        return { status: adjHome > adjAway ? "WON" : "LOST", reason: `FT ${homeGoals}:${awayGoals} (EH)` };
+      }
+      if (/\bdraw\b|\bx\b/i.test(desc)) {
+        return { status: adjHome === adjAway ? "WON" : "LOST", reason: `FT ${homeGoals}:${awayGoals} (EH)` };
+      }
+      if (/\baway\b|\b2\b/i.test(desc)) {
+        return { status: adjAway > adjHome ? "WON" : "LOST", reason: `FT ${homeGoals}:${awayGoals} (EH)` };
+      }
+    }
+  }
+  if (marketId === "36") {
+    const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
+    const line = specMatch ? Number(specMatch[1]) : NaN;
+    const bothScored = homeGoals > 0 && awayGoals > 0;
+    const isOver = /\bover\b/i.test(desc);
+    const isUnder = /\bunder\b/i.test(desc);
+    const wantYes = /\byes\b|\bgg\b/i.test(desc);
+    const wantNo = /\bno\b|\bng\b/i.test(desc);
+    if (Number.isFinite(line) && (isOver || isUnder) && (wantYes || wantNo)) {
+      const ouOk = isOver ? totalGoals > line : totalGoals < line;
+      const ggOk = wantYes ? bothScored : !bothScored;
+      return {
+        status: ouOk && ggOk ? "WON" : "LOST",
+        reason: `FT ${homeGoals}:${awayGoals} (O/U ${line} & BTTS)`
+      };
+    }
+  }
+  return {
+    status: "UNVERIFIED",
+    reason: `Market ${marketId} (${sel.outcomeDesc}) requires manual official verification.`
+  };
+}
+function computeTicketMatchProgress(ticket) {
+  const totalMatchCount = ticket.selections.length;
+  let settledMatchCount = 0;
+  for (const sel of ticket.selections) {
+    const record = ticket.selectionSettlements.find((s) => s.selectionKey === sel.selectionKey);
+    if (record && isSelectionTerminalStatus(record.status)) {
+      settledMatchCount++;
+    }
+  }
+  return {
+    totalMatchCount,
+    settledMatchCount,
+    unfinishedMatchCount: Math.max(0, totalMatchCount - settledMatchCount)
+  };
+}
+function evaluateSingleSelectionFromLookup(sel, existingSel, matchLookup, nowMs, checkedAt) {
+  if (existingSel && isSelectionTerminalStatus(existingSel.status)) {
+    return existingSel;
+  }
+  const match = matchLookup.get(sel.eventId) ?? null;
+  if (!match) {
+    const beforeKickoff = sel.estimateStartTime > 0 && nowMs < sel.estimateStartTime;
+    const pastGrace = sel.estimateStartTime > 0 && nowMs > sel.estimateStartTime + 3 * 36e5;
+    const preservedPostponed = existingSel?.status === "POSTPONED" || existingSel?.status === "SUSPENDED" ? existingSel.status : null;
+    const fallbackStatus = preservedPostponed ? preservedPostponed : pastGrace ? "UNVERIFIED" : beforeKickoff ? "UPCOMING" : "PENDING";
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: fallbackStatus,
+      officialMatchStatus: existingSel?.officialMatchStatus || sel.matchStatus,
+      score: existingSel?.score || null,
+      playedSeconds: existingSel?.playedSeconds || null,
+      currentOdds: existingSel?.currentOdds ?? sel.odds,
+      oddsChanged: false,
+      reason: fallbackStatus === "UNVERIFIED" ? "Official final score unavailable after match window \u2014 marked UNVERIFIED (never treated as WON/LOST)." : fallbackStatus === "POSTPONED" || fallbackStatus === "SUSPENDED" ? `Match ${fallbackStatus.toLowerCase()} \u2014 waiting for official completion or void` : fallbackStatus === "UPCOMING" ? "Scheduled upcoming kickoff" : "Awaiting official result / feed update",
+      checkedAt
+    };
+  }
+  const liveOdds = match.markets.find((m) => m.marketId === sel.marketId && (m.specifier || "") === (sel.specifier || ""))?.outcomes.find((o) => o.outcomeId === sel.outcomeId)?.odds ?? null;
+  const oddsChanged = liveOdds !== null && Math.abs(liveOdds - sel.odds) >= 0.01;
+  if (isMatchOfficiallyVoided(match.matchStatus, match.statusCode)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: "VOID",
+      officialMatchStatus: match.matchStatus,
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `Match ${match.matchStatus || "Cancelled/Void"} \u2014 leg officially voided at 1.00`,
+      checkedAt
+    };
+  }
+  if (isMatchPostponed(match.matchStatus, match.statusCode)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: "POSTPONED",
+      officialMatchStatus: match.matchStatus || "Postponed",
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `Match postponed (${match.matchStatus}) \u2014 awaiting completion or official void`,
+      checkedAt
+    };
+  }
+  if (isMatchSuspended(match.matchStatus)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: "SUSPENDED",
+      officialMatchStatus: match.matchStatus || "Suspended",
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `Match suspended (${match.matchStatus}) \u2014 awaiting resumption or official settlement`,
+      checkedAt
+    };
+  }
+  if (isMatchEnded(match.matchStatus, match.statusCode)) {
+    const parsedScore = parseScoreString(match.score);
+    if (!parsedScore) {
+      return {
+        selectionKey: sel.selectionKey,
+        eventId: sel.eventId,
+        status: "UNVERIFIED",
+        officialMatchStatus: match.matchStatus,
+        score: match.score,
+        playedSeconds: match.playedSeconds,
+        currentOdds: liveOdds,
+        oddsChanged,
+        reason: "Match ended without verifiable final score \u2014 marked UNVERIFIED.",
+        checkedAt
+      };
+    }
+    const outcomeRes = settleSingleSelectionOutcome(sel, parsedScore);
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: outcomeRes.status,
+      officialMatchStatus: match.matchStatus,
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: outcomeRes.reason,
+      checkedAt
+    };
+  }
+  if (isMatchLiveStatus(match)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: "LIVE",
+      officialMatchStatus: match.matchStatus,
+      score: match.score || "0:0",
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `In-Play (${match.matchStatus}${match.playedSeconds ? ` ${match.playedSeconds}'` : ""})`,
+      checkedAt
+    };
+  }
+  const upcomingBeforeKickoff = (match.estimateStartTime || sel.estimateStartTime) > nowMs;
+  return {
+    selectionKey: sel.selectionKey,
+    eventId: sel.eventId,
+    status: upcomingBeforeKickoff ? "UPCOMING" : "PENDING",
+    officialMatchStatus: match.matchStatus,
+    score: match.score,
+    playedSeconds: match.playedSeconds,
+    currentOdds: liveOdds,
+    oddsChanged,
+    reason: upcomingBeforeKickoff ? "Scheduled upcoming kickoff" : "Awaiting kickoff / official update",
+    checkedAt
+  };
+}
+function evaluateTicketSettlement(ticket, matchLookup, nowMs = Date.now()) {
+  const checkedAt = new Date(nowMs).toISOString();
+  if (ticket.status === "WON" || ticket.status === "VOID") {
+    const progress2 = computeTicketMatchProgress(ticket);
+    return {
+      ...ticket,
+      ...progress2
+    };
+  }
+  if (ticket.status === "LOST") {
+    const currentProgress = computeTicketMatchProgress(ticket);
+    if (currentProgress.unfinishedMatchCount === 0) {
+      return {
+        ...ticket,
+        ...currentProgress
+      };
+    }
+    const updatedRemainingSettlements = ticket.selections.map((sel) => {
+      const existingSel = ticket.selectionSettlements.find(
+        (s) => s.selectionKey === sel.selectionKey
+      );
+      if (existingSel && isSelectionTerminalStatus(existingSel.status)) {
+        return existingSel;
+      }
+      return evaluateSingleSelectionFromLookup(sel, existingSel, matchLookup, nowMs, checkedAt);
+    });
+    const nextProgress = computeTicketMatchProgress({
+      selections: ticket.selections,
+      selectionSettlements: updatedRemainingSettlements
+    });
+    return {
+      ...ticket,
+      selectionSettlements: updatedRemainingSettlements,
+      ...nextProgress,
+      lastCheckedAt: checkedAt
+    };
+  }
+  const nextSettlements = ticket.selections.map((sel) => {
+    const existingSel = ticket.selectionSettlements.find(
+      (s) => s.selectionKey === sel.selectionKey
+    );
+    return evaluateSingleSelectionFromLookup(sel, existingSel, matchLookup, nowMs, checkedAt);
+  });
+  const hasLost = nextSettlements.some((s) => s.status === "LOST");
+  const allVoid = nextSettlements.length > 0 && nextSettlements.every((s) => s.status === "VOID");
+  const allTerminal = nextSettlements.every((s) => isSelectionTerminalStatus(s.status));
+  const hasWon = nextSettlements.some((s) => s.status === "WON");
+  const hasVoid = nextSettlements.some((s) => s.status === "VOID");
+  const hasUnverified = nextSettlements.some((s) => s.status === "UNVERIFIED");
+  const hasLive = nextSettlements.some((s) => s.status === "LIVE");
+  const hasWaitingMatch = nextSettlements.some(
+    (s) => s.status === "UPCOMING" || s.status === "PENDING" || s.status === "POSTPONED" || s.status === "SUSPENDED"
+  );
+  let effectiveCombinedOdds = 1;
+  for (let i = 0; i < ticket.selections.length; i++) {
+    const leg = ticket.selections[i];
+    const legSettlement = nextSettlements[i];
+    if (legSettlement?.status === "VOID") {
+      effectiveCombinedOdds *= 1;
+    } else {
+      effectiveCombinedOdds *= leg.odds;
+    }
+  }
+  effectiveCombinedOdds = Number(effectiveCombinedOdds.toFixed(2));
+  let ticketStatus = "PENDING";
+  let settledAt = null;
+  if (hasLost) {
+    ticketStatus = "LOST";
+    settledAt = checkedAt;
+  } else if (allVoid) {
+    ticketStatus = "VOID";
+    effectiveCombinedOdds = 1;
+    settledAt = checkedAt;
+  } else if (allTerminal && hasWon) {
+    ticketStatus = "WON";
+    settledAt = checkedAt;
+  } else if (hasUnverified) {
+    ticketStatus = "UNVERIFIED";
+  } else if ((hasWon || hasVoid) && (hasWaitingMatch || hasLive)) {
+    ticketStatus = "PARTIALLY_SETTLED";
+  } else if (hasLive) {
+    ticketStatus = "LIVE";
+  } else {
+    ticketStatus = "PENDING";
+  }
+  const progress = computeTicketMatchProgress({
+    selections: ticket.selections,
+    selectionSettlements: nextSettlements
+  });
+  return {
+    ...ticket,
+    status: ticketStatus,
+    effectiveCombinedOdds,
+    selectionSettlements: nextSettlements,
+    ...progress,
+    settledAt,
+    lastCheckedAt: checkedAt
+  };
+}
+function evaluateBookmakerCycleLock(params) {
+  const { bookmakerId, activeCycle, cycleTickets, verificationFailures = [] } = params;
+  const cycleId = activeCycle?.cycleId || cycleTickets[0]?.cycleId || null;
+  const unfinishedMatches = [];
+  const unsettledTicketIds = [];
+  let totalMatchesInCycle = 0;
+  let finishedMatchesCount = 0;
+  let unverifiedMatchesCount = 0;
+  let settledTicketsInCycle = 0;
+  for (const ticket of cycleTickets) {
+    const ticketHasTerminalStatus = isTicketTerminalStatus(ticket.status);
+    let ticketHasUnfinishedLeg = false;
+    for (const sel of ticket.selections) {
+      totalMatchesInCycle++;
+      const settlement = ticket.selectionSettlements.find(
+        (s) => s.selectionKey === sel.selectionKey
+      );
+      const st = settlement?.status || "UPCOMING";
+      if (isSelectionTerminalStatus(st)) {
+        finishedMatchesCount++;
+      } else {
+        ticketHasUnfinishedLeg = true;
+        if (st === "UNVERIFIED") {
+          unverifiedMatchesCount++;
+        }
+        unfinishedMatches.push({
+          bookmakerId,
+          cycleId: cycleId || ticket.cycleId || "LEGACY_CYCLE",
+          ticketId: ticket.internalTicketId,
+          eventId: sel.eventId,
+          selectionKey: sel.selectionKey,
+          homeTeam: sel.homeTeam,
+          awayTeam: sel.awayTeam,
+          kickoffMs: sel.estimateStartTime,
+          status: st,
+          reason: settlement?.reason || "Awaiting verified final match result"
+        });
+      }
+    }
+    if (ticketHasTerminalStatus && !ticketHasUnfinishedLeg) {
+      settledTicketsInCycle++;
+    } else {
+      unsettledTicketIds.push(ticket.internalTicketId);
+    }
+  }
+  const cycleEventIds = new Set(cycleTickets.flatMap((t) => t.selections.map((s) => s.eventId)));
+  const relevantFailures = verificationFailures.filter(
+    (f) => f.bookmakerId === bookmakerId && (cycleEventIds.size === 0 || cycleEventIds.has(f.eventId))
+  );
+  const unfinishedMatchesCount = unfinishedMatches.length;
+  const unsettledTicketsCount = unsettledTicketIds.length;
+  const totalTicketsInCycle = cycleTickets.length;
+  const hasActiveContent = Boolean(activeCycle && activeCycle.status === "ACTIVE") || totalTicketsInCycle > 0;
+  const generationLocked = hasActiveContent && (unfinishedMatchesCount > 0 || unsettledTicketsCount > 0 || unverifiedMatchesCount > 0 || relevantFailures.length > 0);
+  let lockReason = "All matches in previous cycle settled \u2014 eligible for new daily feed generation.";
+  if (totalTicketsInCycle === 0 && !activeCycle) {
+    lockReason = "No active cycle yet \u2014 unlocked for initial permanent feed generation.";
+  } else if (generationLocked) {
+    const parts = [];
+    if (unfinishedMatchesCount > 0) {
+      parts.push(`${unfinishedMatchesCount} unfinished match selection(s)`);
+    }
+    if (unverifiedMatchesCount > 0) {
+      parts.push(`${unverifiedMatchesCount} unverified result(s)`);
+    }
+    if (relevantFailures.length > 0) {
+      parts.push(`${relevantFailures.length} result verification failure(s)`);
+    }
+    if (unsettledTicketsCount > 0) {
+      parts.push(`${unsettledTicketsCount} unsettled ticket(s)`);
+    }
+    lockReason = `LOCKED: Waiting for ${parts.join(", ")} in cycle ${cycleId || "current"} before generating a new daily feed.`;
+  }
+  return {
+    bookmakerId,
+    activeCycleId: cycleId,
+    generationLocked,
+    lockStatus: generationLocked ? "LOCKED" : "UNLOCKED",
+    lockReason,
+    totalTicketsInCycle,
+    settledTicketsInCycle,
+    unsettledTicketsCount,
+    totalMatchesInCycle,
+    finishedMatchesCount,
+    unfinishedMatchesCount,
+    unverifiedMatchesCount,
+    verificationFailuresCount: relevantFailures.length,
+    unfinishedMatches,
+    unsettledTicketIds
+  };
+}
+function makeBreakdownRows(groups) {
+  const rows = [];
+  for (const [label, list] of groups.entries()) {
+    const won = list.filter((t) => t.status === "WON").length;
+    const lost = list.filter((t) => t.status === "LOST").length;
+    const voided = list.filter((t) => t.status === "VOID").length;
+    const pending = list.filter(
+      (t) => t.status === "PENDING" || t.status === "LIVE" || t.status === "PARTIALLY_SETTLED" || t.status === "UNVERIFIED"
+    ).length;
+    const settledNonVoid = won + lost;
+    rows.push({
+      label,
+      total: list.length,
+      won,
+      lost,
+      voided,
+      pending,
+      settledNonVoid,
+      winRatePct: settledNonVoid > 0 ? Number((won / settledNonVoid * 100).toFixed(1)) : null
+    });
+  }
+  return rows.sort((a, b) => b.total - a.total);
+}
+function computePerformanceAnalytics(tickets, meta) {
+  const wonCount = tickets.filter((t) => t.status === "WON").length;
+  const lostCount = tickets.filter((t) => t.status === "LOST").length;
+  const voidCount = tickets.filter((t) => t.status === "VOID").length;
+  const partiallySettledCount = tickets.filter(
+    (t) => t.status === "PARTIALLY_SETTLED"
+  ).length;
+  const pendingOrLiveCount = tickets.filter(
+    (t) => t.status === "PENDING" || t.status === "LIVE"
+  ).length;
+  const unverifiedCount = tickets.filter((t) => t.status === "UNVERIFIED").length;
+  const validSharingCodes = tickets.filter((t) => Boolean(t.shareCode && t.shareCodeVerified)).length;
+  const failedBookingCodes = tickets.filter((t) => t.bookingCodeStatus === "FAILED").length;
+  const generatedToday = meta?.todayKey ? tickets.filter((t) => t.generatedDateKey === meta.todayKey).length : tickets.length;
+  const totalSettled = wonCount + lostCount + voidCount;
+  const settledNonVoidDenominator = wonCount + lostCount;
+  const winRatePct = settledNonVoidDenominator > 0 ? Number((wonCount / settledNonVoidDenominator * 100).toFixed(1)) : null;
+  const categoryGroups = /* @__PURE__ */ new Map();
+  const marketGroups = /* @__PURE__ */ new Map();
+  const leagueGroups = /* @__PURE__ */ new Map();
+  const dailyMap = /* @__PURE__ */ new Map();
+  for (const t of tickets) {
+    const catLabel = t.categoryLabel || "Custom";
+    categoryGroups.set(catLabel, [...categoryGroups.get(catLabel) || [], t]);
+    const seenMkts = /* @__PURE__ */ new Set();
+    const seenLeagues = /* @__PURE__ */ new Set();
+    for (const s of t.selections) {
+      if (!seenMkts.has(s.marketName)) {
+        seenMkts.add(s.marketName);
+        marketGroups.set(s.marketName, [...marketGroups.get(s.marketName) || [], t]);
+      }
+      if (!seenLeagues.has(s.leagueName)) {
+        seenLeagues.add(s.leagueName);
+        leagueGroups.set(s.leagueName, [...leagueGroups.get(s.leagueName) || [], t]);
+      }
+    }
+    const dayRow = dailyMap.get(t.generatedDateKey) || {
+      dateKey: t.generatedDateKey,
+      generated: 0,
+      won: 0,
+      lost: 0,
+      voided: 0
+    };
+    dayRow.generated += 1;
+    if (t.status === "WON") dayRow.won += 1;
+    if (t.status === "LOST") dayRow.lost += 1;
+    if (t.status === "VOID") dayRow.voided += 1;
+    dailyMap.set(t.generatedDateKey, dayRow);
+  }
+  return {
+    totalGenerated: tickets.length,
+    generatedToday,
+    dailyTarget: meta?.dailyTarget ?? 55,
+    totalSettled,
+    wonCount,
+    lostCount,
+    voidCount,
+    partiallySettledCount,
+    pendingOrLiveCount,
+    unverifiedCount,
+    validSharingCodes,
+    failedBookingCodes,
+    settledNonVoidDenominator,
+    winRatePct,
+    lastScanningAt: meta?.lastScanningAt ?? null,
+    lastSettlementAt: meta?.lastSettlementAt ?? null,
+    byCategory: makeBreakdownRows(categoryGroups),
+    byMarket: makeBreakdownRows(marketGroups).slice(0, 12),
+    byLeague: makeBreakdownRows(leagueGroups).slice(0, 12),
+    dailyTrends: Array.from(dailyMap.values()).sort(
+      (a, b) => a.dateKey.localeCompare(b.dateKey)
+    ),
+    performanceDisclaimer: "Metrics represent automatically generated candidate combinations and their verified bookmaker market settlements (Won / (Won + Lost)). Candidate tickets are distinct from actual wagers placed by users; hypothetical multipliers are never presented as real betting profits."
+  };
+}
+
 // backend/services/automationStore.ts
 var DEFAULT_DAILY_FACTORY_CONFIG = {
   enabled: true,
@@ -3007,7 +3701,7 @@ var DEFAULT_DAILY_FACTORY_CONFIG = {
   dailyTicketTarget: 55,
   liveFootballTarget: 12,
   otherSportsTarget: 12,
-  autoReplenishOnSettle: true,
+  autoReplenishOnSettle: false,
   maxTickets: 120,
   minSelections: 2,
   maxSelections: 15,
@@ -3026,38 +3720,131 @@ var DEFAULT_DAILY_FACTORY_CONFIG = {
   autoCreateBookingCodes: true,
   scheduleIntervalMinutes: 60
 };
+function createDefaultBookmakerFeedState(bookmakerId) {
+  const info = getBookmakerInfo(bookmakerId);
+  return {
+    bookmakerId,
+    bookmakerName: info.name,
+    activeCycleId: null,
+    generationLocked: false,
+    lockStatus: "UNLOCKED",
+    lockReason: `No active ${info.shortName} cycle yet \u2014 unlocked for permanent daily feed generation.`,
+    totalTicketsInCycle: 0,
+    settledTicketsInCycle: 0,
+    unsettledTicketsCount: 0,
+    totalMatchesInCycle: 0,
+    finishedMatchesCount: 0,
+    unfinishedMatchesCount: 0,
+    unverifiedMatchesCount: 0,
+    verificationFailuresCount: 0,
+    lastGenerationAt: null,
+    lastResultCheckAt: null,
+    lastUnlockedAt: null,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
 var DATA_DIR2 = process.env.VERCEL ? path2.join(os2.tmpdir(), "sportybet-odds-hunter") : path2.resolve(process.cwd(), ".data");
 var STATE_FILE = path2.join(DATA_DIR2, "automation-state.json");
-function isTerminalStatus(status) {
-  return status === "WON" || status === "LOST" || status === "VOID";
-}
 function normalizeStoredTicket(t) {
+  const bkId = normalizeBookmakerId(t.bookmakerId);
+  const progress = computeTicketMatchProgress({
+    selections: Array.isArray(t.selections) ? t.selections : [],
+    selectionSettlements: Array.isArray(t.selectionSettlements) ? t.selectionSettlements : []
+  });
   return {
     ...t,
-    bookmakerId: t.bookmakerId || "SPORTYBET_TZ",
-    bookmakerName: t.bookmakerName || (t.bookmakerId === "BETPAWA_TZ" ? "betPawa Tanzania" : "SportyBet Tanzania"),
+    bookmakerId: bkId,
+    bookmakerName: t.bookmakerName || getBookmakerInfo(bkId).name,
     feedSection: t.feedSection || "UPCOMING",
     sportId: t.sportId || t.selections?.[0]?.sportId || "sr:sport:1",
     sportName: t.sportName || t.selections?.[0]?.sportName || "Football",
-    replacedTicketId: t.replacedTicketId ?? null
+    replacedTicketId: t.replacedTicketId ?? null,
+    settledMatchCount: t.settledMatchCount ?? progress.settledMatchCount,
+    totalMatchCount: t.totalMatchCount ?? progress.totalMatchCount,
+    unfinishedMatchCount: t.unfinishedMatchCount ?? progress.unfinishedMatchCount
   };
+}
+function buildLegacyCyclesFromTickets(tickets) {
+  const byCycleKey = /* @__PURE__ */ new Map();
+  for (const t of tickets) {
+    const bkId = normalizeBookmakerId(t.bookmakerId);
+    const prefix = bkId === "BETPAWA_TZ" ? "BP" : "SB";
+    const cId = t.cycleId || `CYC_${prefix}_${(t.generatedDateKey || "LEGACY").replace(/-/g, "")}`;
+    t.cycleId = cId;
+    t.idempotencyKey = t.idempotencyKey || `${bkId}::${cId}`;
+    const arr = byCycleKey.get(cId) || [];
+    arr.push(t);
+    byCycleKey.set(cId, arr);
+  }
+  const cycles = [];
+  for (const [cycleId, group] of byCycleKey.entries()) {
+    const bkId = normalizeBookmakerId(group[0]?.bookmakerId);
+    const lockEval = evaluateBookmakerCycleLock({
+      bookmakerId: bkId,
+      activeCycle: null,
+      cycleTickets: group,
+      verificationFailures: []
+    });
+    const allSettled = !lockEval.generationLocked && group.length > 0;
+    cycles.push({
+      cycleId,
+      idempotencyKey: group[0]?.idempotencyKey || `${bkId}::${cycleId}`,
+      bookmakerId: bkId,
+      dateKey: group[0]?.generatedDateKey || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+      status: allSettled ? "SETTLED" : "ACTIVE",
+      generationLocked: !allSettled,
+      ticketIds: group.map((t) => t.internalTicketId),
+      ticketCount: group.length,
+      totalMatches: lockEval.totalMatchesInCycle,
+      finishedMatches: lockEval.finishedMatchesCount,
+      unfinishedMatches: lockEval.unfinishedMatchesCount,
+      wonTickets: group.filter((t) => t.status === "WON").length,
+      lostTickets: group.filter((t) => t.status === "LOST").length,
+      voidTickets: group.filter((t) => t.status === "VOID").length,
+      createdAt: group[group.length - 1]?.generatedAt || (/* @__PURE__ */ new Date()).toISOString(),
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      settledAt: allSettled ? (/* @__PURE__ */ new Date()).toISOString() : null
+    });
+  }
+  return cycles.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }
 var AutomationStore = class {
   constructor() {
     this.state = this.loadFromDisk();
+    this.recomputeAllBookmakerStates();
+  }
+  createInitialState() {
+    return {
+      schemaVersion: 3,
+      tickets: [],
+      feedCycles: [],
+      feedStates: {
+        SPORTYBET_TZ: createDefaultBookmakerFeedState("SPORTYBET_TZ"),
+        BETPAWA_TZ: createDefaultBookmakerFeedState("BETPAWA_TZ")
+      },
+      matchResults: [],
+      verificationFailures: [],
+      usedIdempotencyKeys: [],
+      factoryConfig: { ...DEFAULT_DAILY_FACTORY_CONFIG },
+      logs: [],
+      lastFactoryRunAt: null,
+      lastResultsRunAt: null,
+      lastScanningAt: null,
+      dailyShortfallReason: null
+    };
   }
   loadFromDisk() {
     try {
       if (fs2.existsSync(STATE_FILE)) {
         const raw = fs2.readFileSync(STATE_FILE, "utf-8");
         const parsed = JSON.parse(raw);
-        if (parsed.schemaVersion === 2) {
+        if (parsed.schemaVersion === 2 || parsed.schemaVersion === 3) {
           const mergedCfg = {
             ...DEFAULT_DAILY_FACTORY_CONFIG,
             ...parsed.factoryConfig || {},
             liveFootballTarget: Math.max(10, parsed.factoryConfig?.liveFootballTarget ?? 12),
             otherSportsTarget: Math.max(10, parsed.factoryConfig?.otherSportsTarget ?? 12),
-            autoReplenishOnSettle: parsed.factoryConfig?.autoReplenishOnSettle ?? true
+            autoReplenishOnSettle: parsed.factoryConfig?.autoReplenishOnSettle ?? false
           };
           if (!Array.isArray(mergedCfg.oddsCategories) || mergedCfg.oddsCategories.length === 0) {
             mergedCfg.oddsCategories = DEFAULT_ODDS_CATEGORIES;
@@ -3066,37 +3853,39 @@ var AutomationStore = class {
           mergedCfg.markets = sanitizedMarkets.length > 0 ? sanitizedMarkets : [...DEFAULT_ALLOWED_DAILY_FEED_MARKETS];
           const rawTickets = Array.isArray(parsed.tickets) ? parsed.tickets.map(normalizeStoredTicket) : [];
           const tickets = rawTickets.filter((t) => isTicketAllowedInDailyFeed(t));
+          const migratedCycles = Array.isArray(parsed.feedCycles) && parsed.feedCycles.length > 0 ? parsed.feedCycles : buildLegacyCyclesFromTickets(tickets);
+          const base = this.createInitialState();
           const sanitizedState = {
-            schemaVersion: 2,
+            ...base,
+            schemaVersion: 3,
             tickets,
+            feedCycles: migratedCycles,
+            feedStates: {
+              SPORTYBET_TZ: {
+                ...createDefaultBookmakerFeedState("SPORTYBET_TZ"),
+                ...parsed.feedStates?.SPORTYBET_TZ || {}
+              },
+              BETPAWA_TZ: {
+                ...createDefaultBookmakerFeedState("BETPAWA_TZ"),
+                ...parsed.feedStates?.BETPAWA_TZ || {}
+              }
+            },
+            matchResults: Array.isArray(parsed.matchResults) ? parsed.matchResults : [],
+            verificationFailures: Array.isArray(parsed.verificationFailures) ? parsed.verificationFailures : [],
+            usedIdempotencyKeys: Array.isArray(parsed.usedIdempotencyKeys) ? parsed.usedIdempotencyKeys : migratedCycles.map((c) => c.idempotencyKey),
             factoryConfig: mergedCfg,
-            logs: Array.isArray(parsed.logs) ? parsed.logs.slice(0, 150) : [],
+            logs: Array.isArray(parsed.logs) ? parsed.logs.slice(0, 200) : [],
             lastFactoryRunAt: parsed.lastFactoryRunAt ?? null,
             lastResultsRunAt: parsed.lastResultsRunAt ?? null,
             lastScanningAt: parsed.lastScanningAt ?? parsed.lastFactoryRunAt ?? null,
             dailyShortfallReason: parsed.dailyShortfallReason ?? null
           };
-          if (tickets.length !== rawTickets.length) {
-            try {
-              fs2.writeFileSync(STATE_FILE, JSON.stringify(sanitizedState, null, 2), "utf-8");
-            } catch {
-            }
-          }
           return sanitizedState;
         }
       }
     } catch {
     }
-    return {
-      schemaVersion: 2,
-      tickets: [],
-      factoryConfig: { ...DEFAULT_DAILY_FACTORY_CONFIG },
-      logs: [],
-      lastFactoryRunAt: null,
-      lastResultsRunAt: null,
-      lastScanningAt: null,
-      dailyShortfallReason: null
-    };
+    return this.createInitialState();
   }
   flushToDisk() {
     try {
@@ -3108,30 +3897,37 @@ var AutomationStore = class {
       console.error("Failed to persist automation state:", err);
     }
   }
-  getTickets() {
-    return this.state.tickets.filter((t) => isTicketAllowedInDailyFeed(t));
+  resetForTesting() {
+    this.state = this.createInitialState();
+    this.flushToDisk();
+  }
+  getTickets(bookmakerId) {
+    const allowed = this.state.tickets.filter((t) => isTicketAllowedInDailyFeed(t));
+    if (!bookmakerId) return allowed;
+    return allowed.filter((t) => normalizeBookmakerId(t.bookmakerId) === bookmakerId);
   }
   getTicketById(internalTicketId) {
     const ticket = this.state.tickets.find((t) => t.internalTicketId === internalTicketId);
     if (!ticket || !isTicketAllowedInDailyFeed(ticket)) return void 0;
     return ticket;
   }
-  getExistingSignatures() {
-    return new Set(this.getTickets().map((t) => t.signature));
+  getExistingSignatures(bookmakerId) {
+    return new Set(this.getTickets(bookmakerId).map((t) => t.signature));
   }
-  getExistingShareCodes(excludeTicketId) {
+  getExistingShareCodes(excludeTicketId, bookmakerId) {
     const codes = /* @__PURE__ */ new Set();
-    for (const t of this.state.tickets) {
+    for (const t of this.getTickets(bookmakerId)) {
       if (excludeTicketId && t.internalTicketId === excludeTicketId) continue;
       const code = String(t.shareCode || "").trim().toUpperCase();
       if (code) codes.add(code);
     }
     return codes;
   }
-  getExistingEventAndTeamUsage(dateKey, feedSection) {
+  getExistingEventAndTeamUsage(dateKey, feedSection, bookmakerId, cycleId) {
     const eventIds = /* @__PURE__ */ new Set();
     const teamKeys = /* @__PURE__ */ new Set();
-    for (const t of this.getTickets()) {
+    for (const t of this.getTickets(bookmakerId)) {
+      if (cycleId && t.cycleId !== cycleId) continue;
       if (dateKey && t.generatedDateKey !== dateKey) continue;
       if (feedSection && (t.feedSection || "UPCOMING") !== feedSection) continue;
       for (const s of t.selections || []) {
@@ -3141,6 +3937,243 @@ var AutomationStore = class {
       }
     }
     return { eventIds, teamKeys };
+  }
+  hasIdempotencyKey(key) {
+    return this.state.usedIdempotencyKeys.includes(key);
+  }
+  getFeedCycles(bookmakerId) {
+    if (!bookmakerId) return [...this.state.feedCycles];
+    return this.state.feedCycles.filter((c) => c.bookmakerId === bookmakerId);
+  }
+  getActiveCycle(bookmakerId) {
+    const active = this.state.feedCycles.find(
+      (c) => c.bookmakerId === bookmakerId && c.status === "ACTIVE"
+    );
+    if (active) return active;
+    const latest = this.state.feedCycles.find((c) => c.bookmakerId === bookmakerId);
+    return latest && latest.generationLocked ? latest : null;
+  }
+  getCycleTickets(bookmakerId, cycleId) {
+    const bkTickets = this.getTickets(bookmakerId);
+    if (cycleId) {
+      return bkTickets.filter((t) => t.cycleId === cycleId);
+    }
+    const active = this.getActiveCycle(bookmakerId);
+    if (active) {
+      return bkTickets.filter((t) => t.cycleId === active.cycleId);
+    }
+    return bkTickets.filter((t) => !isTicketTerminalStatus(t.status));
+  }
+  getFeedStates() {
+    return {
+      SPORTYBET_TZ: { ...this.state.feedStates.SPORTYBET_TZ },
+      BETPAWA_TZ: { ...this.state.feedStates.BETPAWA_TZ }
+    };
+  }
+  getFeedState(bookmakerId) {
+    return { ...this.state.feedStates[bookmakerId] };
+  }
+  getVerificationFailures(bookmakerId) {
+    if (!bookmakerId) return [...this.state.verificationFailures];
+    return this.state.verificationFailures.filter((f) => f.bookmakerId === bookmakerId);
+  }
+  recordVerificationFailure(params) {
+    const failureId = `${params.bookmakerId}::${params.eventId}`;
+    const existingIdx = this.state.verificationFailures.findIndex(
+      (f) => f.failureId === failureId
+    );
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    if (existingIdx >= 0) {
+      const prev = this.state.verificationFailures[existingIdx];
+      this.state.verificationFailures[existingIdx] = {
+        ...prev,
+        ticketIds: Array.from(/* @__PURE__ */ new Set([...prev.ticketIds, ...params.ticketIds])),
+        error: params.error,
+        attempts: prev.attempts + 1,
+        lastAttemptAt: nowIso
+      };
+    } else {
+      this.state.verificationFailures.unshift({
+        failureId,
+        bookmakerId: params.bookmakerId,
+        eventId: params.eventId,
+        ticketIds: Array.from(new Set(params.ticketIds)),
+        homeTeam: params.homeTeam,
+        awayTeam: params.awayTeam,
+        error: params.error,
+        attempts: 1,
+        lastAttemptAt: nowIso
+      });
+      this.state.verificationFailures = this.state.verificationFailures.slice(0, 200);
+    }
+    this.flushToDisk();
+  }
+  clearVerificationFailure(bookmakerId, eventId) {
+    const failureId = `${bookmakerId}::${eventId}`;
+    const before = this.state.verificationFailures.length;
+    this.state.verificationFailures = this.state.verificationFailures.filter(
+      (f) => f.failureId !== failureId
+    );
+    if (this.state.verificationFailures.length !== before) {
+      this.flushToDisk();
+    }
+  }
+  getMatchResults(bookmakerId) {
+    if (!bookmakerId) return [...this.state.matchResults];
+    return this.state.matchResults.filter((m) => m.bookmakerId === bookmakerId);
+  }
+  upsertMatchResults(records) {
+    if (records.length === 0) return;
+    const byId = new Map(this.state.matchResults.map((r) => [r.resultId, r]));
+    for (const r of records) {
+      const existing = byId.get(r.resultId);
+      if (existing && existing.verified && isSelectionTerminalStatus(existing.status)) {
+        continue;
+      }
+      byId.set(r.resultId, r);
+    }
+    this.state.matchResults = Array.from(byId.values()).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 1e3);
+    this.flushToDisk();
+  }
+  recomputeBookmakerState(bookmakerId) {
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const activeCycle = this.getActiveCycle(bookmakerId);
+    const cycleTickets = activeCycle ? this.getTickets(bookmakerId).filter((t) => t.cycleId === activeCycle.cycleId) : [];
+    const lockEval = evaluateBookmakerCycleLock({
+      bookmakerId,
+      activeCycle,
+      cycleTickets,
+      verificationFailures: this.getVerificationFailures(bookmakerId)
+    });
+    if (activeCycle) {
+      const idx = this.state.feedCycles.findIndex((c) => c.cycleId === activeCycle.cycleId);
+      if (idx >= 0) {
+        const prevCycle = this.state.feedCycles[idx];
+        const nextStatus = lockEval.generationLocked ? "ACTIVE" : "SETTLED";
+        this.state.feedCycles[idx] = {
+          ...prevCycle,
+          status: nextStatus,
+          generationLocked: lockEval.generationLocked,
+          totalMatches: lockEval.totalMatchesInCycle,
+          finishedMatches: lockEval.finishedMatchesCount,
+          unfinishedMatches: lockEval.unfinishedMatchesCount,
+          wonTickets: cycleTickets.filter((t) => t.status === "WON").length,
+          lostTickets: cycleTickets.filter((t) => t.status === "LOST").length,
+          voidTickets: cycleTickets.filter((t) => t.status === "VOID").length,
+          settledAt: nextStatus === "SETTLED" ? prevCycle.settledAt || nowIso : prevCycle.settledAt,
+          updatedAt: nowIso
+        };
+      }
+    }
+    const prevFeedState = this.state.feedStates[bookmakerId] || createDefaultBookmakerFeedState(bookmakerId);
+    const justUnlocked = prevFeedState.generationLocked && !lockEval.generationLocked;
+    const nextFeedState = {
+      bookmakerId,
+      bookmakerName: getBookmakerInfo(bookmakerId).name,
+      activeCycleId: activeCycle ? activeCycle.cycleId : prevFeedState.activeCycleId,
+      generationLocked: lockEval.generationLocked,
+      lockStatus: lockEval.lockStatus,
+      lockReason: lockEval.lockReason,
+      totalTicketsInCycle: lockEval.totalTicketsInCycle,
+      settledTicketsInCycle: lockEval.settledTicketsInCycle,
+      unsettledTicketsCount: lockEval.unsettledTicketsCount,
+      totalMatchesInCycle: lockEval.totalMatchesInCycle,
+      finishedMatchesCount: lockEval.finishedMatchesCount,
+      unfinishedMatchesCount: lockEval.unfinishedMatchesCount,
+      unverifiedMatchesCount: lockEval.unverifiedMatchesCount,
+      verificationFailuresCount: lockEval.verificationFailuresCount,
+      lastGenerationAt: prevFeedState.lastGenerationAt,
+      lastResultCheckAt: prevFeedState.lastResultCheckAt,
+      lastUnlockedAt: justUnlocked ? nowIso : prevFeedState.lastUnlockedAt,
+      updatedAt: nowIso
+    };
+    this.state.feedStates[bookmakerId] = nextFeedState;
+    return nextFeedState;
+  }
+  recomputeAllBookmakerStates() {
+    this.recomputeBookmakerState("SPORTYBET_TZ");
+    this.recomputeBookmakerState("BETPAWA_TZ");
+    this.flushToDisk();
+    return this.getFeedStates();
+  }
+  registerCycleAndTickets(params) {
+    const { cycle, newTickets, generationTimestamp } = params;
+    if (this.hasIdempotencyKey(cycle.idempotencyKey)) {
+      return {
+        inserted: [],
+        cycle,
+        skippedReason: `Duplicate generation blocked by idempotencyKey ${cycle.idempotencyKey}.`
+      };
+    }
+    const currentLock = this.getFeedState(cycle.bookmakerId);
+    if (currentLock.generationLocked) {
+      return {
+        inserted: [],
+        cycle,
+        skippedReason: currentLock.lockReason
+      };
+    }
+    const existingIds = new Set(this.state.tickets.map((t) => t.internalTicketId));
+    const existingSigs = new Set(
+      this.getTickets(cycle.bookmakerId).map((t) => t.signature)
+    );
+    const existingCodes = this.getExistingShareCodes(void 0, cycle.bookmakerId);
+    const inserted = [];
+    for (const rawTicket of newTickets) {
+      const t = normalizeStoredTicket({
+        ...rawTicket,
+        bookmakerId: cycle.bookmakerId,
+        cycleId: cycle.cycleId,
+        idempotencyKey: cycle.idempotencyKey
+      });
+      if (!isTicketAllowedInDailyFeed(t)) continue;
+      if (existingIds.has(t.internalTicketId) || existingSigs.has(t.signature)) continue;
+      existingIds.add(t.internalTicketId);
+      existingSigs.add(t.signature);
+      const cleanCode = String(t.shareCode || "").trim().toUpperCase();
+      if (cleanCode && existingCodes.has(cleanCode)) {
+        inserted.push({
+          ...t,
+          shareCode: null,
+          shareUrl: null,
+          shareCodeDeadline: null,
+          shareCodeVerified: false,
+          bookingCodeStatus: "FAILED",
+          bookingCodeError: `Duplicate booking code ${cleanCode} rejected to preserve unique card codes.`
+        });
+      } else {
+        if (cleanCode) existingCodes.add(cleanCode);
+        inserted.push(t);
+      }
+    }
+    if (inserted.length === 0) {
+      return {
+        inserted: [],
+        cycle,
+        skippedReason: "No valid unique tickets produced for this cycle."
+      };
+    }
+    const savedCycle = {
+      ...cycle,
+      ticketIds: inserted.map((t) => t.internalTicketId),
+      ticketCount: inserted.length,
+      status: "ACTIVE",
+      generationLocked: true
+    };
+    this.state.usedIdempotencyKeys = [
+      cycle.idempotencyKey,
+      ...this.state.usedIdempotencyKeys
+    ].slice(0, 500);
+    this.state.feedCycles = [savedCycle, ...this.state.feedCycles].slice(0, 200);
+    this.state.tickets = [...inserted, ...this.state.tickets].slice(0, 2e3);
+    this.state.feedStates[cycle.bookmakerId] = {
+      ...this.state.feedStates[cycle.bookmakerId],
+      activeCycleId: savedCycle.cycleId,
+      lastGenerationAt: generationTimestamp
+    };
+    this.recomputeBookmakerState(cycle.bookmakerId);
+    this.flushToDisk();
+    return { inserted, cycle: savedCycle };
   }
   addTickets(newTickets) {
     const existingIds = new Set(this.state.tickets.map((t) => t.internalTicketId));
@@ -3170,10 +4203,42 @@ var AutomationStore = class {
       }
     }
     if (inserted.length > 0) {
-      this.state.tickets = [...inserted, ...this.state.tickets].slice(0, 1e3);
+      this.state.tickets = [...inserted, ...this.state.tickets].slice(0, 2e3);
+      this.recomputeAllBookmakerStates();
       this.flushToDisk();
     }
     return inserted;
+  }
+  hydrateFromExternal(params) {
+    const added = this.hydrateTickets(params.tickets);
+    if (Array.isArray(params.cycles) && params.cycles.length > 0) {
+      const byId = new Map(this.state.feedCycles.map((c) => [c.cycleId, c]));
+      for (const c of params.cycles) {
+        if (!byId.has(c.cycleId)) {
+          byId.set(c.cycleId, c);
+        }
+        if (c.idempotencyKey && !this.hasIdempotencyKey(c.idempotencyKey)) {
+          this.state.usedIdempotencyKeys.push(c.idempotencyKey);
+        }
+      }
+      this.state.feedCycles = Array.from(byId.values()).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 200);
+    }
+    if (params.feedStates) {
+      for (const bk of ["SPORTYBET_TZ", "BETPAWA_TZ"]) {
+        if (params.feedStates[bk]) {
+          this.state.feedStates[bk] = {
+            ...this.state.feedStates[bk],
+            ...params.feedStates[bk]
+          };
+        }
+      }
+    }
+    if (Array.isArray(params.matchResults) && params.matchResults.length > 0) {
+      this.upsertMatchResults(params.matchResults);
+    }
+    this.recomputeAllBookmakerStates();
+    this.flushToDisk();
+    return added;
   }
   /**
    * Hydrate backend memory from Firebase publicTickets (used after Vercel cold starts)
@@ -3200,12 +4265,15 @@ var AutomationStore = class {
         addedOrUpdated++;
       } else {
         const current = this.state.tickets[existingIdx];
-        if (!isTerminalStatus(current.status) && isTerminalStatus(ticket.status)) {
+        if (!isTicketTerminalStatus(current.status) && isTicketTerminalStatus(ticket.status)) {
           this.state.tickets[existingIdx] = {
             ...current,
             status: ticket.status,
             effectiveCombinedOdds: ticket.effectiveCombinedOdds,
             selectionSettlements: ticket.selectionSettlements,
+            settledMatchCount: ticket.settledMatchCount,
+            totalMatchCount: ticket.totalMatchCount,
+            unfinishedMatchCount: ticket.unfinishedMatchCount,
             settledAt: ticket.settledAt,
             lastCheckedAt: ticket.lastCheckedAt,
             shareCode: current.shareCode || ticket.shareCode,
@@ -3218,7 +4286,8 @@ var AutomationStore = class {
       }
     }
     if (toPrepend.length > 0 || addedOrUpdated > 0) {
-      this.state.tickets = [...toPrepend, ...this.state.tickets].sort((a, b) => Date.parse(b.generatedAt) - Date.parse(a.generatedAt)).slice(0, 1e3);
+      this.state.tickets = [...toPrepend, ...this.state.tickets].sort((a, b) => Date.parse(b.generatedAt) - Date.parse(a.generatedAt)).slice(0, 2e3);
+      this.recomputeAllBookmakerStates();
       this.flushToDisk();
     }
     return addedOrUpdated;
@@ -3229,13 +4298,29 @@ var AutomationStore = class {
     );
     if (idx === -1) return null;
     const original = this.state.tickets[idx];
-    if (isTerminalStatus(original.status)) {
+    if (original.status === "WON" || original.status === "VOID") {
       return original;
+    }
+    if (original.status === "LOST") {
+      const mergedLostProgress = {
+        ...original,
+        selectionSettlements: updated.selectionSettlements,
+        settledMatchCount: updated.settledMatchCount,
+        totalMatchCount: updated.totalMatchCount,
+        unfinishedMatchCount: updated.unfinishedMatchCount,
+        lastCheckedAt: updated.lastCheckedAt
+      };
+      this.state.tickets[idx] = mergedLostProgress;
+      this.flushToDisk();
+      return mergedLostProgress;
     }
     const merged = {
       ...original,
       status: updated.status,
       effectiveCombinedOdds: updated.effectiveCombinedOdds,
+      settledMatchCount: updated.settledMatchCount,
+      totalMatchCount: updated.totalMatchCount,
+      unfinishedMatchCount: updated.unfinishedMatchCount,
       selectionSettlements: updated.selectionSettlements,
       shareCode: updated.shareCode,
       shareUrl: updated.shareUrl,
@@ -3256,6 +4341,7 @@ var AutomationStore = class {
       (t) => t.internalTicketId !== internalTicketId
     );
     if (this.state.tickets.length !== before) {
+      this.recomputeAllBookmakerStates();
       this.flushToDisk();
       return true;
     }
@@ -3271,7 +4357,7 @@ var AutomationStore = class {
       ...config,
       liveFootballTarget: Math.max(10, config.liveFootballTarget ?? 12),
       otherSportsTarget: Math.max(10, config.otherSportsTarget ?? 12),
-      autoReplenishOnSettle: config.autoReplenishOnSettle ?? true,
+      autoReplenishOnSettle: config.autoReplenishOnSettle ?? false,
       markets: sanitizedMarkets.length > 0 ? sanitizedMarkets : [...DEFAULT_ALLOWED_DAILY_FEED_MARKETS]
     };
     this.flushToDisk();
@@ -3281,7 +4367,7 @@ var AutomationStore = class {
     return this.state.logs;
   }
   addLog(log) {
-    this.state.logs = [log, ...this.state.logs].slice(0, 150);
+    this.state.logs = [log, ...this.state.logs].slice(0, 200);
     this.flushToDisk();
   }
   getTimestamps() {
@@ -3302,8 +4388,16 @@ var AutomationStore = class {
     this.state.dailyShortfallReason = shortfallReason;
     this.flushToDisk();
   }
-  setResultsRunAt(runAt) {
+  setResultsRunAt(runAt, bookmakersChecked) {
     this.state.lastResultsRunAt = runAt;
+    if (bookmakersChecked) {
+      for (const bk of bookmakersChecked) {
+        this.state.feedStates[bk] = {
+          ...this.state.feedStates[bk],
+          lastResultCheckAt: runAt
+        };
+      }
+    }
     this.flushToDisk();
   }
 };
@@ -4708,502 +5802,393 @@ async function runLiveOddsScan(config) {
 // backend/services/schedulerService.ts
 import crypto6 from "crypto";
 
-// backend/services/settlementService.ts
-function parseScoreString(score) {
-  if (!score) return null;
-  const m = /(\d+)\s*[:\-]\s*(\d+)/.exec(String(score).trim());
-  if (!m) return null;
-  const homeGoals = Number(m[1]);
-  const awayGoals = Number(m[2]);
-  if (!Number.isInteger(homeGoals) || !Number.isInteger(awayGoals)) return null;
-  if (homeGoals < 0 || awayGoals < 0) return null;
-  return { homeGoals, awayGoals };
+// backend/firebase/firestoreBridge.ts
+import { FieldValue } from "firebase-admin/firestore";
+function sanitizeId(id) {
+  return String(id || "").replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 120);
 }
-function isMatchPostponedOrCancelled(matchStatus, statusCode) {
-  if (statusCode === 5 || statusCode === 6 || statusCode === 7) return true;
-  return /\b(postponed|cancelled|canceled|abandoned|suspended|walkover|interrupted)\b/i.test(
-    matchStatus || ""
-  );
-}
-function isMatchEnded(matchStatus, statusCode) {
-  if (statusCode === 3 || statusCode === 4) return true;
-  return /\b(ended|ft|finished|full\s*time|aet|ap|closed)\b/i.test(matchStatus || "");
-}
-function isMatchLiveStatus(match) {
-  if (match.isLive || match.statusCode === 1) return true;
-  return /\b(h1|h2|ht|live|1st\s*half|2nd\s*half|extra\s*time|halftime|break)\b/i.test(
-    match.matchStatus || ""
-  );
-}
-function settleSingleSelectionOutcome(sel, score) {
-  const { homeGoals, awayGoals } = score;
-  const totalGoals = homeGoals + awayGoals;
-  const marketId = String(sel.marketId).trim();
-  const outcomeId = String(sel.outcomeId).trim();
-  const desc = (sel.outcomeDesc || "").trim().toLowerCase();
-  const spec = (sel.specifier || "").trim().toLowerCase();
-  if (marketId === "1" || marketId === "3743") {
-    if (outcomeId === "1" || desc === "home" || desc === "1") {
-      return {
-        status: homeGoals > awayGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (Home)`
-      };
-    }
-    if (outcomeId === "2" || desc === "draw" || desc === "x") {
-      return {
-        status: homeGoals === awayGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (Draw)`
-      };
-    }
-    if (outcomeId === "3" || desc === "away" || desc === "2") {
-      return {
-        status: awayGoals > homeGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (Away)`
-      };
-    }
+var FirebaseAdminBridge = class {
+  isConfigured() {
+    return getAdminFirestoreIfConfigured() !== null;
   }
-  if (marketId === "10" || marketId === "4693") {
-    if (outcomeId === "9" || /\b1x\b|home.*draw/i.test(desc)) {
-      return {
-        status: homeGoals >= awayGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (1X)`
-      };
-    }
-    if (outcomeId === "10" || /\b12\b|home.*away/i.test(desc)) {
-      return {
-        status: homeGoals !== awayGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (12)`
-      };
-    }
-    if (outcomeId === "11" || /\bx2\b|draw.*away/i.test(desc)) {
-      return {
-        status: awayGoals >= homeGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (X2)`
-      };
-    }
-  }
-  if (marketId === "18" || marketId === "5000" || marketId === "225" || marketId === "238" || marketId === "236" || marketId === "189") {
-    const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
-    const descMatch = /(over|under)\s*(\d+(?:\.\d+)?)/i.exec(desc);
-    const line = specMatch ? Number(specMatch[1]) : descMatch ? Number(descMatch[2]) : NaN;
-    const isOver = outcomeId === "12" || /\bover\b/i.test(desc);
-    const isUnder = outcomeId === "13" || /\bunder\b/i.test(desc);
-    if (Number.isFinite(line) && (isOver || isUnder)) {
-      const sportId = sel.sportId || "";
-      const isSetScoredSport = sportId === "sr:sport:5" || sportId === "sr:sport:20" || sportId === "sr:sport:23";
-      if (isSetScoredSport && line >= 12 && totalGoals <= 7) {
-        return {
-          status: "UNVERIFIED",
-          reason: `Set score ${homeGoals}:${awayGoals} cannot verify total points/games line ${line} \u2014 requires detailed point count.`
-        };
-      }
-      if (totalGoals === line) {
-        return {
-          status: "VOID",
-          reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} pushes line ${line})`
-        };
-      }
-      const won = isOver ? totalGoals > line : totalGoals < line;
-      return {
-        status: won ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} vs ${isOver ? "Over" : "Under"} ${line})`
-      };
-    }
-  }
-  if (marketId === "19" || marketId === "20" || marketId === "5006" || marketId === "5003") {
-    const teamGoals = marketId === "19" || marketId === "5006" ? homeGoals : awayGoals;
-    const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
-    const descMatch = /(over|under)\s*(\d+(?:\.\d+)?)/i.exec(desc);
-    const line = specMatch ? Number(specMatch[1]) : descMatch ? Number(descMatch[2]) : NaN;
-    const isOver = outcomeId === "12" || /\bover\b/i.test(desc);
-    const isUnder = outcomeId === "13" || /\bunder\b/i.test(desc);
-    if (Number.isFinite(line) && (isOver || isUnder)) {
-      if (teamGoals === line) {
-        return { status: "VOID", reason: `FT ${homeGoals}:${awayGoals} (Team total pushes ${line})` };
-      }
-      const won = isOver ? teamGoals > line : teamGoals < line;
-      return {
-        status: won ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (Team total ${teamGoals} vs ${isOver ? "Over" : "Under"} ${line})`
-      };
-    }
-  }
-  if (marketId === "29" || marketId === "3795") {
-    const bothScored = homeGoals > 0 && awayGoals > 0;
-    if (outcomeId === "74" || desc === "yes" || desc === "gg") {
-      return {
-        status: bothScored ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (BTTS Yes)`
-      };
-    }
-    if (outcomeId === "76" || desc === "no" || desc === "ng") {
-      return {
-        status: !bothScored ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (BTTS No)`
-      };
-    }
-  }
-  if (marketId === "11" || marketId === "4703") {
-    if (homeGoals === awayGoals) {
-      return {
-        status: "VOID",
-        reason: `FT ${homeGoals}:${awayGoals} (Draw No Bet voided on draw)`
-      };
-    }
-    if (outcomeId === "4" || /\bhome\b|\b1\b/i.test(desc)) {
-      return {
-        status: homeGoals > awayGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (DNB Home)`
-      };
-    }
-    if (outcomeId === "5" || /\baway\b|\b2\b/i.test(desc)) {
-      return {
-        status: awayGoals > homeGoals ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (DNB Away)`
-      };
-    }
-  }
-  if (marketId === "26" || marketId === "4833") {
-    const isOdd = totalGoals % 2 === 1;
-    if (outcomeId === "70" || /\bodd\b/i.test(desc)) {
-      return {
-        status: isOdd ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} ${isOdd ? "Odd" : "Even"})`
-      };
-    }
-    if (outcomeId === "72" || /\beven\b/i.test(desc)) {
-      return {
-        status: !isOdd ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (Total ${totalGoals} ${isOdd ? "Odd" : "Even"})`
-      };
-    }
-  }
-  if (marketId === "16" || marketId === "3774") {
-    const hcpSpec = /hcp=([+-]?\d+(?:\.\d+)?)/.exec(spec);
-    if (hcpSpec) {
-      const hcp = Number(hcpSpec[1]);
-      const isHome = outcomeId === "1714" || /\bhome\b|\b1\b/i.test(desc);
-      const isAway = outcomeId === "1715" || /\baway\b|\b2\b/i.test(desc);
-      if (isHome || isAway) {
-        const diff = isHome ? homeGoals + hcp - awayGoals : awayGoals - hcp - homeGoals;
-        if (Math.abs(diff) < 1e-9) {
+  /**
+   * Atomically creates a new generation cycle document + immutable ticket records in Firestore
+   * if and only if no matching idempotencyKey or overlapping ACTIVE cycle exists.
+   */
+  async commitGenerationCycleTransaction(params) {
+    const db = getAdminFirestoreIfConfigured();
+    if (!db) return { committed: false };
+    const { cycle, tickets, feedState, actorUid = "system_cron", dailyTicketTarget } = params;
+    const bookmakerStateRef = db.collection("bookmakerFeedStates").doc(cycle.bookmakerId);
+    const cycleRef = db.collection("feedCycles").doc(sanitizeId(cycle.cycleId));
+    try {
+      const outcome = await db.runTransaction(async (tx) => {
+        const stateSnap = await tx.get(bookmakerStateRef);
+        if (stateSnap.exists) {
+          const currentState = stateSnap.data();
+          if (currentState.generationLocked === true || currentState.lockStatus === "LOCKED") {
+            return {
+              committed: false,
+              skippedReason: currentState.lockReason || `Bookmaker ${cycle.bookmakerId} feed is locked in Firestore.`
+            };
+          }
+        }
+        const existingCycleSnap = await tx.get(cycleRef);
+        if (existingCycleSnap.exists) {
           return {
-            status: "VOID",
-            reason: `FT ${homeGoals}:${awayGoals} (Asian Handicap push)`
+            committed: false,
+            skippedReason: `Cycle ${cycle.cycleId} already exists (idempotency enforced).`
           };
         }
-        return {
-          status: diff > 0 ? "WON" : "LOST",
-          reason: `FT ${homeGoals}:${awayGoals} (AH ${hcp})`
-        };
-      }
-    }
-  }
-  if (marketId === "14") {
-    const hcpSpec = /hcp=(\d+)\s*:\s*(\d+)/.exec(spec);
-    if (hcpSpec) {
-      const adjHome = homeGoals + Number(hcpSpec[1]);
-      const adjAway = awayGoals + Number(hcpSpec[2]);
-      if (/\bhome\b|\b1\b/i.test(desc)) {
-        return { status: adjHome > adjAway ? "WON" : "LOST", reason: `FT ${homeGoals}:${awayGoals} (EH)` };
-      }
-      if (/\bdraw\b|\bx\b/i.test(desc)) {
-        return { status: adjHome === adjAway ? "WON" : "LOST", reason: `FT ${homeGoals}:${awayGoals} (EH)` };
-      }
-      if (/\baway\b|\b2\b/i.test(desc)) {
-        return { status: adjAway > adjHome ? "WON" : "LOST", reason: `FT ${homeGoals}:${awayGoals} (EH)` };
-      }
-    }
-  }
-  if (marketId === "36") {
-    const specMatch = /total=(\d+(?:\.\d+)?)/.exec(spec);
-    const line = specMatch ? Number(specMatch[1]) : NaN;
-    const bothScored = homeGoals > 0 && awayGoals > 0;
-    const isOver = /\bover\b/i.test(desc);
-    const isUnder = /\bunder\b/i.test(desc);
-    const wantYes = /\byes\b|\bgg\b/i.test(desc);
-    const wantNo = /\bno\b|\bng\b/i.test(desc);
-    if (Number.isFinite(line) && (isOver || isUnder) && (wantYes || wantNo)) {
-      const ouOk = isOver ? totalGoals > line : totalGoals < line;
-      const ggOk = wantYes ? bothScored : !bothScored;
+        tx.set(cycleRef, {
+          isPublic: true,
+          cycleId: cycle.cycleId,
+          idempotencyKey: cycle.idempotencyKey,
+          bookmakerId: cycle.bookmakerId,
+          dateKey: cycle.dateKey,
+          status: cycle.status,
+          generationLocked: cycle.generationLocked,
+          ticketIds: cycle.ticketIds.slice(0, 200),
+          ticketCount: cycle.ticketCount,
+          totalMatches: cycle.totalMatches,
+          finishedMatches: cycle.finishedMatches,
+          unfinishedMatches: cycle.unfinishedMatches,
+          wonTickets: cycle.wonTickets,
+          lostTickets: cycle.lostTickets,
+          voidTickets: cycle.voidTickets,
+          settledAt: cycle.settledAt || "",
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        for (const t of tickets) {
+          const docId = sanitizeId(t.internalTicketId);
+          const pubRef = db.collection("publicTickets").doc(docId);
+          const updRef = db.collection("publicTicketUpdates").doc(docId);
+          const progress = computeTicketMatchProgress(t);
+          tx.create(pubRef, {
+            isPublic: true,
+            publishedByUid: actorUid,
+            internalTicketId: t.internalTicketId,
+            signature: t.signature,
+            bookmakerId: t.bookmakerId || cycle.bookmakerId,
+            cycleId: cycle.cycleId,
+            idempotencyKey: t.idempotencyKey || cycle.idempotencyKey,
+            feedSection: t.feedSection || "UPCOMING",
+            sportId: t.sportId || "sr:sport:1",
+            sportName: t.sportName || "Football",
+            replacedTicketId: t.replacedTicketId || "",
+            sourceType: t.sourceType,
+            categoryId: t.categoryId,
+            categoryLabel: t.categoryLabel,
+            targetOdds: t.targetOdds,
+            actualCombinedOdds: t.actualCombinedOdds,
+            selectionCount: t.selectionCount,
+            kickoffStartMs: t.kickoffStartMs,
+            kickoffEndMs: t.kickoffEndMs,
+            dataSource: t.dataSource,
+            generatedDateKey: t.generatedDateKey,
+            originalSelections: t.selections,
+            createdAt: FieldValue.serverTimestamp()
+          });
+          tx.create(updRef, {
+            isPublic: true,
+            internalTicketId: t.internalTicketId,
+            bookmakerId: t.bookmakerId || cycle.bookmakerId,
+            cycleId: cycle.cycleId,
+            status: t.status,
+            effectiveCombinedOdds: t.effectiveCombinedOdds,
+            settledMatchCount: progress.settledMatchCount,
+            totalMatchCount: progress.totalMatchCount,
+            unfinishedMatchCount: progress.unfinishedMatchCount,
+            shareCode: t.shareCode || "",
+            shareUrl: t.shareUrl || "",
+            shareCodeVerified: Boolean(t.shareCodeVerified),
+            bookingCodeStatus: t.bookingCodeStatus,
+            bookingCodeError: t.bookingCodeError || "",
+            selectionSettlements: t.selectionSettlements,
+            settledAt: t.settledAt || "",
+            createdAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp()
+          });
+        }
+        tx.set(bookmakerStateRef, {
+          isPublic: true,
+          ...feedState,
+          activeCycleId: feedState.activeCycleId || "",
+          lastGenerationAt: feedState.lastGenerationAt || "",
+          lastResultCheckAt: feedState.lastResultCheckAt || "",
+          lastUnlockedAt: feedState.lastUnlockedAt || "",
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        const statRef = db.collection("publicStats").doc(`daily_${cycle.bookmakerId}`);
+        tx.set(statRef, {
+          isPublic: true,
+          bookmakerId: cycle.bookmakerId,
+          activeCycleId: cycle.cycleId,
+          generationLocked: feedState.generationLocked,
+          lockStatus: feedState.lockStatus,
+          lockReason: feedState.lockReason,
+          dailyTicketTarget,
+          totalGeneratedToday: tickets.length,
+          bookingCodesGeneratedToday: tickets.filter(
+            (t) => t.bookingCodeStatus === "GENERATED" && Boolean(t.shareCode)
+          ).length,
+          unfinishedMatchesCount: feedState.unfinishedMatchesCount,
+          unsettledTicketsCount: feedState.unsettledTicketsCount,
+          settledWonCount: 0,
+          settledLostCount: 0,
+          settledVoidCount: 0,
+          lastScanningAt: feedState.lastGenerationAt || "",
+          lastSettlementAt: feedState.lastResultCheckAt || "",
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        return { committed: true };
+      });
+      return outcome;
+    } catch (err) {
+      console.error("Firestore cycle transaction error:", err);
       return {
-        status: ouOk && ggOk ? "WON" : "LOST",
-        reason: `FT ${homeGoals}:${awayGoals} (O/U ${line} & BTTS)`
+        committed: false,
+        skippedReason: err instanceof Error ? err.message : "Firestore transaction failed"
       };
     }
   }
-  return {
-    status: "UNVERIFIED",
-    reason: `Market ${marketId} (${sel.outcomeDesc}) requires manual official verification.`
-  };
-}
-function evaluateTicketSettlement(ticket, matchLookup, nowMs = Date.now()) {
-  const checkedAt = new Date(nowMs).toISOString();
-  if (ticket.status === "WON" || ticket.status === "LOST" || ticket.status === "VOID") {
-    return ticket;
-  }
-  const nextSettlements = ticket.selections.map((sel) => {
-    const existingSel = ticket.selectionSettlements.find(
-      (s) => s.selectionKey === sel.selectionKey
-    );
-    if (existingSel && (existingSel.status === "WON" || existingSel.status === "LOST" || existingSel.status === "VOID")) {
-      return existingSel;
-    }
-    const match = matchLookup.get(sel.eventId) ?? null;
-    if (!match) {
-      const pastGrace = sel.estimateStartTime > 0 && nowMs > sel.estimateStartTime + 3 * 36e5;
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: pastGrace ? "UNVERIFIED" : "PENDING",
-        officialMatchStatus: existingSel?.officialMatchStatus || sel.matchStatus,
-        score: existingSel?.score || null,
-        playedSeconds: existingSel?.playedSeconds || null,
-        currentOdds: existingSel?.currentOdds ?? sel.odds,
-        oddsChanged: false,
-        reason: pastGrace ? "Official final score unavailable after match window \u2014 marked UNVERIFIED (never treated as loss)." : "Awaiting kickoff / feed update",
-        checkedAt
-      };
-    }
-    const liveOdds = match.markets.find((m) => m.marketId === sel.marketId && (m.specifier || "") === (sel.specifier || ""))?.outcomes.find((o) => o.outcomeId === sel.outcomeId)?.odds ?? null;
-    const oddsChanged = liveOdds !== null && Math.abs(liveOdds - sel.odds) >= 0.01;
-    if (isMatchPostponedOrCancelled(match.matchStatus, match.statusCode)) {
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: "VOID",
-        officialMatchStatus: match.matchStatus,
-        score: match.score,
-        playedSeconds: match.playedSeconds,
-        currentOdds: liveOdds,
-        oddsChanged,
-        reason: `Match ${match.matchStatus} \u2014 leg voided at 1.00`,
-        checkedAt
-      };
-    }
-    if (isMatchEnded(match.matchStatus, match.statusCode)) {
-      const parsedScore = parseScoreString(match.score);
-      if (!parsedScore) {
-        return {
-          selectionKey: sel.selectionKey,
-          eventId: sel.eventId,
-          status: "UNVERIFIED",
-          officialMatchStatus: match.matchStatus,
-          score: match.score,
-          playedSeconds: match.playedSeconds,
-          currentOdds: liveOdds,
-          oddsChanged,
-          reason: "Match ended without verifiable final score \u2014 marked UNVERIFIED.",
-          checkedAt
-        };
+  async syncSettlementState(params) {
+    const db = getAdminFirestoreIfConfigured();
+    if (!db) return;
+    try {
+      const batch = db.batch();
+      for (const t of params.updatedTickets.slice(0, 150)) {
+        const docId = sanitizeId(t.internalTicketId);
+        const updRef = db.collection("publicTicketUpdates").doc(docId);
+        const progress = computeTicketMatchProgress(t);
+        batch.set(
+          updRef,
+          {
+            isPublic: true,
+            internalTicketId: t.internalTicketId,
+            bookmakerId: t.bookmakerId || "SPORTYBET_TZ",
+            cycleId: t.cycleId || "",
+            status: t.status,
+            effectiveCombinedOdds: t.effectiveCombinedOdds,
+            settledMatchCount: progress.settledMatchCount,
+            totalMatchCount: progress.totalMatchCount,
+            unfinishedMatchCount: progress.unfinishedMatchCount,
+            shareCode: t.shareCode || "",
+            shareUrl: t.shareUrl || "",
+            shareCodeVerified: Boolean(t.shareCodeVerified),
+            bookingCodeStatus: t.bookingCodeStatus,
+            bookingCodeError: t.bookingCodeError || "",
+            selectionSettlements: t.selectionSettlements,
+            settledAt: t.settledAt || "",
+            updatedAt: FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
       }
-      const outcomeRes = settleSingleSelectionOutcome(sel, parsedScore);
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: outcomeRes.status,
-        officialMatchStatus: match.matchStatus,
-        score: match.score,
-        playedSeconds: match.playedSeconds,
-        currentOdds: liveOdds,
-        oddsChanged,
-        reason: outcomeRes.reason,
-        checkedAt
-      };
-    }
-    if (isMatchLiveStatus(match)) {
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: "LIVE",
-        officialMatchStatus: match.matchStatus,
-        score: match.score || "0:0",
-        playedSeconds: match.playedSeconds,
-        currentOdds: liveOdds,
-        oddsChanged,
-        reason: `In-Play (${match.matchStatus}${match.playedSeconds ? ` ${match.playedSeconds}'` : ""})`,
-        checkedAt
-      };
-    }
-    return {
-      selectionKey: sel.selectionKey,
-      eventId: sel.eventId,
-      status: "PENDING",
-      officialMatchStatus: match.matchStatus,
-      score: match.score,
-      playedSeconds: match.playedSeconds,
-      currentOdds: liveOdds,
-      oddsChanged,
-      reason: "Scheduled upcoming kickoff",
-      checkedAt
-    };
-  });
-  const hasLost = nextSettlements.some((s) => s.status === "LOST");
-  const allVoid = nextSettlements.length > 0 && nextSettlements.every((s) => s.status === "VOID");
-  const allTerminal = nextSettlements.every(
-    (s) => s.status === "WON" || s.status === "LOST" || s.status === "VOID"
-  );
-  const hasWon = nextSettlements.some((s) => s.status === "WON");
-  const hasVoid = nextSettlements.some((s) => s.status === "VOID");
-  const hasUnverified = nextSettlements.some((s) => s.status === "UNVERIFIED");
-  const hasLive = nextSettlements.some((s) => s.status === "LIVE");
-  const hasPending = nextSettlements.some((s) => s.status === "PENDING");
-  let effectiveCombinedOdds = 1;
-  for (let i = 0; i < ticket.selections.length; i++) {
-    const leg = ticket.selections[i];
-    const legSettlement = nextSettlements[i];
-    if (legSettlement?.status === "VOID") {
-      effectiveCombinedOdds *= 1;
-    } else {
-      effectiveCombinedOdds *= leg.odds;
-    }
-  }
-  effectiveCombinedOdds = Number(effectiveCombinedOdds.toFixed(2));
-  let ticketStatus = "PENDING";
-  let settledAt = null;
-  if (hasLost) {
-    ticketStatus = "LOST";
-    settledAt = checkedAt;
-  } else if (allVoid) {
-    ticketStatus = "VOID";
-    effectiveCombinedOdds = 1;
-    settledAt = checkedAt;
-  } else if (allTerminal && hasWon) {
-    ticketStatus = "WON";
-    settledAt = checkedAt;
-  } else if (hasUnverified) {
-    ticketStatus = "UNVERIFIED";
-  } else if ((hasWon || hasVoid) && (hasPending || hasLive)) {
-    ticketStatus = "PARTIALLY_SETTLED";
-  } else if (hasLive) {
-    ticketStatus = "LIVE";
-  } else {
-    ticketStatus = "PENDING";
-  }
-  return {
-    ...ticket,
-    status: ticketStatus,
-    effectiveCombinedOdds,
-    selectionSettlements: nextSettlements,
-    settledAt,
-    lastCheckedAt: checkedAt
-  };
-}
-function makeBreakdownRows(groups) {
-  const rows = [];
-  for (const [label, list] of groups.entries()) {
-    const won = list.filter((t) => t.status === "WON").length;
-    const lost = list.filter((t) => t.status === "LOST").length;
-    const voided = list.filter((t) => t.status === "VOID").length;
-    const pending = list.filter(
-      (t) => t.status === "PENDING" || t.status === "LIVE" || t.status === "PARTIALLY_SETTLED" || t.status === "UNVERIFIED"
-    ).length;
-    const settledNonVoid = won + lost;
-    rows.push({
-      label,
-      total: list.length,
-      won,
-      lost,
-      voided,
-      pending,
-      settledNonVoid,
-      winRatePct: settledNonVoid > 0 ? Number((won / settledNonVoid * 100).toFixed(1)) : null
-    });
-  }
-  return rows.sort((a, b) => b.total - a.total);
-}
-function computePerformanceAnalytics(tickets, meta) {
-  const wonCount = tickets.filter((t) => t.status === "WON").length;
-  const lostCount = tickets.filter((t) => t.status === "LOST").length;
-  const voidCount = tickets.filter((t) => t.status === "VOID").length;
-  const partiallySettledCount = tickets.filter(
-    (t) => t.status === "PARTIALLY_SETTLED"
-  ).length;
-  const pendingOrLiveCount = tickets.filter(
-    (t) => t.status === "PENDING" || t.status === "LIVE"
-  ).length;
-  const unverifiedCount = tickets.filter((t) => t.status === "UNVERIFIED").length;
-  const validSharingCodes = tickets.filter((t) => Boolean(t.shareCode && t.shareCodeVerified)).length;
-  const failedBookingCodes = tickets.filter((t) => t.bookingCodeStatus === "FAILED").length;
-  const generatedToday = meta?.todayKey ? tickets.filter((t) => t.generatedDateKey === meta.todayKey).length : tickets.length;
-  const totalSettled = wonCount + lostCount + voidCount;
-  const settledNonVoidDenominator = wonCount + lostCount;
-  const winRatePct = settledNonVoidDenominator > 0 ? Number((wonCount / settledNonVoidDenominator * 100).toFixed(1)) : null;
-  const categoryGroups = /* @__PURE__ */ new Map();
-  const marketGroups = /* @__PURE__ */ new Map();
-  const leagueGroups = /* @__PURE__ */ new Map();
-  const dailyMap = /* @__PURE__ */ new Map();
-  for (const t of tickets) {
-    const catLabel = t.categoryLabel || "Custom";
-    categoryGroups.set(catLabel, [...categoryGroups.get(catLabel) || [], t]);
-    const seenMkts = /* @__PURE__ */ new Set();
-    const seenLeagues = /* @__PURE__ */ new Set();
-    for (const s of t.selections) {
-      if (!seenMkts.has(s.marketName)) {
-        seenMkts.add(s.marketName);
-        marketGroups.set(s.marketName, [...marketGroups.get(s.marketName) || [], t]);
+      for (const mr of params.matchResults.slice(0, 120)) {
+        const ref = db.collection("matchResults").doc(sanitizeId(mr.resultId));
+        batch.set(ref, {
+          isPublic: true,
+          ...mr,
+          updatedAt: FieldValue.serverTimestamp()
+        });
       }
-      if (!seenLeagues.has(s.leagueName)) {
-        seenLeagues.add(s.leagueName);
-        leagueGroups.set(s.leagueName, [...leagueGroups.get(s.leagueName) || [], t]);
+      for (const c of params.cycles.slice(0, 20)) {
+        const ref = db.collection("feedCycles").doc(sanitizeId(c.cycleId));
+        batch.set(
+          ref,
+          {
+            isPublic: true,
+            status: c.status,
+            generationLocked: c.generationLocked,
+            finishedMatches: c.finishedMatches,
+            unfinishedMatches: c.unfinishedMatches,
+            wonTickets: c.wonTickets,
+            lostTickets: c.lostTickets,
+            voidTickets: c.voidTickets,
+            settledAt: c.settledAt || "",
+            updatedAt: FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
       }
+      for (const bk of Object.values(params.feedStates)) {
+        const ref = db.collection("bookmakerFeedStates").doc(bk.bookmakerId);
+        batch.set(ref, {
+          isPublic: true,
+          ...bk,
+          activeCycleId: bk.activeCycleId || "",
+          lastGenerationAt: bk.lastGenerationAt || "",
+          lastResultCheckAt: bk.lastResultCheckAt || "",
+          lastUnlockedAt: bk.lastUnlockedAt || "",
+          updatedAt: FieldValue.serverTimestamp()
+        });
+      }
+      if (params.log) {
+        const logRef = db.collection("adminAuditLogs").doc(sanitizeId(params.log.logId));
+        batch.set(logRef, {
+          scope: "ADMIN_AUDIT",
+          actorUid: "system_cron",
+          actorEmail: params.log.actorEmail || "vercel-cron@system.local",
+          actionType: params.log.actionType,
+          status: params.log.status,
+          ticketsGenerated: params.log.ticketsGenerated,
+          codesCreated: params.log.codesCreated,
+          message: params.log.message.slice(0, 400),
+          createdAt: FieldValue.serverTimestamp()
+        });
+      }
+      await batch.commit();
+    } catch (err) {
+      console.error("Firestore settlement sync error:", err);
     }
-    const dayRow = dailyMap.get(t.generatedDateKey) || {
-      dateKey: t.generatedDateKey,
-      generated: 0,
-      won: 0,
-      lost: 0,
-      voided: 0
-    };
-    dayRow.generated += 1;
-    if (t.status === "WON") dayRow.won += 1;
-    if (t.status === "LOST") dayRow.lost += 1;
-    if (t.status === "VOID") dayRow.voided += 1;
-    dailyMap.set(t.generatedDateKey, dayRow);
   }
-  return {
-    totalGenerated: tickets.length,
-    generatedToday,
-    dailyTarget: meta?.dailyTarget ?? 55,
-    totalSettled,
-    wonCount,
-    lostCount,
-    voidCount,
-    partiallySettledCount,
-    pendingOrLiveCount,
-    unverifiedCount,
-    validSharingCodes,
-    failedBookingCodes,
-    settledNonVoidDenominator,
-    winRatePct,
-    lastScanningAt: meta?.lastScanningAt ?? null,
-    lastSettlementAt: meta?.lastSettlementAt ?? null,
-    byCategory: makeBreakdownRows(categoryGroups),
-    byMarket: makeBreakdownRows(marketGroups).slice(0, 12),
-    byLeague: makeBreakdownRows(leagueGroups).slice(0, 12),
-    dailyTrends: Array.from(dailyMap.values()).sort(
-      (a, b) => a.dateKey.localeCompare(b.dateKey)
-    ),
-    performanceDisclaimer: "Metrics represent automatically generated candidate combinations and their verified bookmaker market settlements (Won / (Won + Lost)). Candidate tickets are distinct from actual wagers placed by users; hypothetical multipliers are never presented as real betting profits."
-  };
-}
+  /**
+   * Loads existing cycles, tickets, and match results from Firestore on cold start if Admin credentials exist.
+   */
+  async loadPersistedStateFromFirestore() {
+    const db = getAdminFirestoreIfConfigured();
+    if (!db) return null;
+    try {
+      const [pubSnap, updSnap, cyclesSnap, statesSnap, resultsSnap] = await Promise.all([
+        db.collection("publicTickets").limit(400).get(),
+        db.collection("publicTicketUpdates").limit(400).get(),
+        db.collection("feedCycles").limit(60).get(),
+        db.collection("bookmakerFeedStates").get(),
+        db.collection("matchResults").limit(200).get()
+      ]);
+      const updatesMap = /* @__PURE__ */ new Map();
+      updSnap.forEach((doc) => {
+        updatesMap.set(doc.id, doc.data());
+      });
+      const tickets = [];
+      pubSnap.forEach((doc) => {
+        const raw = doc.data();
+        const upd = updatesMap.get(doc.id) || {};
+        const selections = Array.isArray(raw.originalSelections) ? raw.originalSelections : [];
+        const createdTs = raw.createdAt;
+        const createdMs = typeof createdTs?.toMillis === "function" ? createdTs.toMillis() : Date.now();
+        const generatedAt = new Date(createdMs).toISOString();
+        const actualCombinedOdds = Number(raw.actualCombinedOdds || 1);
+        tickets.push({
+          internalTicketId: String(raw.internalTicketId || doc.id),
+          signature: String(raw.signature || doc.id),
+          bookmakerId: raw.bookmakerId || "SPORTYBET_TZ",
+          bookmakerName: raw.bookmakerId === "BETPAWA_TZ" ? "betPawa Tanzania" : "SportyBet Tanzania",
+          cycleId: raw.cycleId ? String(raw.cycleId) : void 0,
+          idempotencyKey: raw.idempotencyKey ? String(raw.idempotencyKey) : void 0,
+          feedSection: raw.feedSection || "UPCOMING",
+          sportId: String(raw.sportId || "sr:sport:1"),
+          sportName: String(raw.sportName || "Football"),
+          replacedTicketId: raw.replacedTicketId ? String(raw.replacedTicketId) : null,
+          sourceType: raw.sourceType || "DAILY_FACTORY",
+          categoryId: String(raw.categoryId || "custom"),
+          categoryLabel: String(raw.categoryLabel || "Custom"),
+          targetOdds: Number(raw.targetOdds || actualCombinedOdds),
+          actualCombinedOdds,
+          oddsDifference: Number((actualCombinedOdds - Number(raw.targetOdds || actualCombinedOdds)).toFixed(2)),
+          selectionCount: Number(raw.selectionCount || selections.length),
+          selections,
+          kickoffStartMs: Number(raw.kickoffStartMs || 0),
+          kickoffEndMs: Number(raw.kickoffEndMs || 0),
+          dataSource: String(raw.dataSource || ""),
+          generatedAt,
+          generatedDateKey: String(raw.generatedDateKey || generatedAt.slice(0, 10)),
+          published: true,
+          revalidatedAt: generatedAt,
+          status: upd.status || "PENDING",
+          effectiveCombinedOdds: Number(upd.effectiveCombinedOdds || actualCombinedOdds),
+          settledMatchCount: typeof upd.settledMatchCount === "number" ? upd.settledMatchCount : void 0,
+          totalMatchCount: typeof upd.totalMatchCount === "number" ? upd.totalMatchCount : void 0,
+          unfinishedMatchCount: typeof upd.unfinishedMatchCount === "number" ? upd.unfinishedMatchCount : void 0,
+          selectionSettlements: Array.isArray(upd.selectionSettlements) ? upd.selectionSettlements : [],
+          shareCode: upd.shareCode ? String(upd.shareCode) : null,
+          shareUrl: upd.shareUrl ? String(upd.shareUrl) : null,
+          shareCodeDeadline: null,
+          shareCodeVerified: Boolean(upd.shareCodeVerified),
+          bookingCodeStatus: upd.bookingCodeStatus || "NOT_REQUESTED",
+          bookingCodeError: upd.bookingCodeError ? String(upd.bookingCodeError) : null,
+          settledAt: upd.settledAt ? String(upd.settledAt) : null,
+          lastCheckedAt: null
+        });
+      });
+      const cycles = [];
+      cyclesSnap.forEach((doc) => {
+        const d = doc.data();
+        cycles.push({
+          cycleId: String(d.cycleId || doc.id),
+          idempotencyKey: String(d.idempotencyKey || doc.id),
+          bookmakerId: d.bookmakerId || "SPORTYBET_TZ",
+          dateKey: String(d.dateKey || ""),
+          status: d.status || "ACTIVE",
+          generationLocked: Boolean(d.generationLocked),
+          ticketIds: Array.isArray(d.ticketIds) ? d.ticketIds : [],
+          ticketCount: Number(d.ticketCount || 0),
+          totalMatches: Number(d.totalMatches || 0),
+          finishedMatches: Number(d.finishedMatches || 0),
+          unfinishedMatches: Number(d.unfinishedMatches || 0),
+          wonTickets: Number(d.wonTickets || 0),
+          lostTickets: Number(d.lostTickets || 0),
+          voidTickets: Number(d.voidTickets || 0),
+          createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          settledAt: d.settledAt ? String(d.settledAt) : null
+        });
+      });
+      const feedStates = {};
+      statesSnap.forEach((doc) => {
+        const d = doc.data();
+        if (d.bookmakerId === "SPORTYBET_TZ" || d.bookmakerId === "BETPAWA_TZ") {
+          feedStates[d.bookmakerId] = {
+            ...d,
+            activeCycleId: d.activeCycleId || null,
+            lastGenerationAt: d.lastGenerationAt || null,
+            lastResultCheckAt: d.lastResultCheckAt || null,
+            lastUnlockedAt: d.lastUnlockedAt || null
+          };
+        }
+      });
+      const matchResults = [];
+      resultsSnap.forEach((doc) => {
+        const d = doc.data();
+        matchResults.push(d);
+      });
+      return { tickets, cycles, feedStates, matchResults };
+    } catch (err) {
+      console.error("Failed to hydrate state from Firestore:", err);
+      return null;
+    }
+  }
+};
+var firebaseAdminBridge = new FirebaseAdminBridge();
 
 // backend/services/schedulerService.ts
 function sleep(ms) {
   if (process.env.NODE_ENV === "test") return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-function isTerminal(status) {
-  return status === "WON" || status === "LOST" || status === "VOID";
-}
+var ALL_BOOKMAKERS = ["SPORTYBET_TZ", "BETPAWA_TZ"];
 var SchedulerService = class {
   constructor() {
     this.factoryTimer = null;
     this.resultsTimer = null;
     this.bootTimer = null;
-    this.factoryLock = false;
+    this.bookmakerLocks = {
+      SPORTYBET_TZ: false,
+      BETPAWA_TZ: false
+    };
     this.resultsLock = false;
+    this.firestoreHydrated = false;
     this.resultsIntervalMinutes = 10;
+  }
+  async ensureFirestoreHydrated() {
+    if (this.firestoreHydrated || !firebaseAdminBridge.isConfigured()) return;
+    this.firestoreHydrated = true;
+    const remote = await firebaseAdminBridge.loadPersistedStateFromFirestore();
+    if (remote && (remote.tickets.length > 0 || remote.cycles.length > 0)) {
+      automationStore.hydrateFromExternal(remote);
+    }
   }
   start() {
     this.rescheduleFactoryTimer();
@@ -5215,17 +6200,24 @@ var SchedulerService = class {
     }
     if (process.env.NODE_ENV !== "test" && !this.bootTimer) {
       this.bootTimer = setTimeout(() => {
-        const cfg = automationStore.getFactoryConfig();
-        if (cfg.enabled && !cfg.paused) {
-          const counts = this.getSectionCountsToday(cfg.timezone);
-          const liveTarget = Math.max(10, cfg.liveFootballTarget ?? 12);
-          const otherTarget = Math.max(10, cfg.otherSportsTarget ?? 12);
-          if (counts.upcomingActive < Math.min(cfg.maxTickets, cfg.dailyTicketTarget) || counts.liveFootballActive < liveTarget || counts.otherSportsActive < otherTarget) {
-            void this.runDailyFactoryJob(false, null);
-          }
-        }
+        void this.bootCatchUp();
       }, 3e3);
       this.bootTimer.unref?.();
+    }
+  }
+  async bootCatchUp() {
+    await this.ensureFirestoreHydrated();
+    const cfg = automationStore.getFactoryConfig();
+    if (!cfg.enabled || cfg.paused) return;
+    await this.runResultsTrackingJob(false, void 0, null);
+    for (const bk of ALL_BOOKMAKERS) {
+      const st = automationStore.getFeedState(bk);
+      if (!st.generationLocked && automationStore.getTickets(bk).length === 0) {
+        await this.runDailyFactoryForBookmaker(bk, {
+          manualTrigger: false,
+          actorEmail: "boot-scheduler"
+        });
+      }
     }
   }
   stop() {
@@ -5265,40 +6257,52 @@ var SchedulerService = class {
     }
     return currentMin >= startMin || currentMin <= endMin;
   }
-  getDailyTicketsCountToday(tz = "Africa/Dar_es_Salaam") {
+  getDailyTicketsCountToday(tz = "Africa/Dar_es_Salaam", bookmakerId) {
     const todayKey = getDateKeyInTimezone(Date.now(), tz);
-    return automationStore.getTickets().filter((t) => t.generatedDateKey === todayKey).length;
+    return automationStore.getTickets(bookmakerId).filter((t) => t.generatedDateKey === todayKey).length;
   }
-  getSectionCountsToday(tz = "Africa/Dar_es_Salaam") {
+  getSectionCountsToday(tz = "Africa/Dar_es_Salaam", bookmakerId) {
     const todayKey = getDateKeyInTimezone(Date.now(), tz);
-    const todayTickets = automationStore.getTickets().filter((t) => t.generatedDateKey === todayKey);
+    const todayTickets = automationStore.getTickets(bookmakerId).filter((t) => t.generatedDateKey === todayKey);
     const upcoming = todayTickets.filter((t) => (t.feedSection || "UPCOMING") === "UPCOMING");
     const liveFootball = todayTickets.filter((t) => t.feedSection === "LIVE_FOOTBALL");
     const otherSports = todayTickets.filter((t) => t.feedSection === "OTHER_SPORTS");
     return {
       totalToday: todayTickets.length,
       upcomingTotal: upcoming.length,
-      upcomingActive: upcoming.filter((t) => !isTerminal(t.status)).length,
+      upcomingActive: upcoming.filter((t) => !isTicketTerminalStatus(t.status)).length,
       liveFootballTotal: liveFootball.length,
-      liveFootballActive: liveFootball.filter((t) => !isTerminal(t.status)).length,
+      liveFootballActive: liveFootball.filter((t) => !isTicketTerminalStatus(t.status)).length,
       otherSportsTotal: otherSports.length,
-      otherSportsActive: otherSports.filter((t) => !isTerminal(t.status)).length
+      otherSportsActive: otherSports.filter((t) => !isTicketTerminalStatus(t.status)).length
     };
   }
-  getStatus() {
+  getStatus(bookmakerFilter) {
     const cfg = automationStore.getFactoryConfig();
     const meta = automationStore.getTimestamps();
-    const allTickets = automationStore.getTickets();
+    const scopedTickets = automationStore.getTickets(bookmakerFilter);
     const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
-    const todayTickets = allTickets.filter((t) => t.generatedDateKey === todayKey);
-    const counts = this.getSectionCountsToday(cfg.timezone);
+    const todayTickets = scopedTickets.filter((t) => t.generatedDateKey === todayKey);
+    const counts = this.getSectionCountsToday(cfg.timezone, bookmakerFilter);
+    const feedStates = automationStore.getFeedStates();
+    const unfinishedMatches = ALL_BOOKMAKERS.flatMap((bk) => {
+      if (bookmakerFilter && bk !== bookmakerFilter) return [];
+      const activeCycle = automationStore.getActiveCycle(bk);
+      const cycleTickets = automationStore.getCycleTickets(bk, activeCycle?.cycleId);
+      return evaluateBookmakerCycleLock({
+        bookmakerId: bk,
+        activeCycle,
+        cycleTickets,
+        verificationFailures: automationStore.getVerificationFailures(bk)
+      }).unfinishedMatches;
+    });
     const nextRun = cfg.enabled && !cfg.paused && meta.lastFactoryRunAt ? new Date(
       Date.parse(meta.lastFactoryRunAt) + Math.max(5, cfg.scheduleIntervalMinutes) * 60 * 1e3
     ).toISOString() : null;
     return {
       enabled: cfg.enabled,
       paused: cfg.paused,
-      factoryRunning: this.factoryLock,
+      factoryRunning: this.bookmakerLocks.SPORTYBET_TZ || this.bookmakerLocks.BETPAWA_TZ,
       resultsTrackerRunning: this.resultsLock,
       resultsIntervalMinutes: this.resultsIntervalMinutes,
       lastFactoryRunAt: meta.lastFactoryRunAt,
@@ -5311,27 +6315,27 @@ var SchedulerService = class {
       liveFootballCount: counts.liveFootballTotal,
       otherSportsCount: counts.otherSportsTotal,
       upcomingActiveCount: counts.upcomingActive,
-      settledWonCount: allTickets.filter((t) => t.status === "WON").length,
-      settledLostCount: allTickets.filter((t) => t.status === "LOST").length,
-      settledVoidCount: allTickets.filter((t) => t.status === "VOID").length,
+      settledWonCount: scopedTickets.filter((t) => t.status === "WON").length,
+      settledLostCount: scopedTickets.filter((t) => t.status === "LOST").length,
+      settledVoidCount: scopedTickets.filter((t) => t.status === "VOID").length,
       bookingCodesGeneratedToday: todayTickets.filter(
         (t) => t.bookingCodeStatus === "GENERATED" && Boolean(t.shareCode)
       ).length,
       bookingCodeFailuresToday: todayTickets.filter(
         (t) => t.bookingCodeStatus === "FAILED"
       ).length,
-      dailyShortfallReason: meta.dailyShortfallReason
+      dailyShortfallReason: meta.dailyShortfallReason,
+      byBookmaker: feedStates,
+      unfinishedMatches,
+      verificationFailures: automationStore.getVerificationFailures(bookmakerFilter)
     };
   }
-  async revalidateAndPublishTickets(candidates, cfg, validationOptions) {
+  async revalidateAndPublishTickets(candidates, cfg, bookmakerId, validationOptions) {
     if (candidates.length === 0) {
       return { publishedTickets: [], rejectedCount: 0, codesCreated: 0, codeFailures: 0 };
     }
-    const activeBookmaker = normalizeBookmakerId(
-      candidates[0]?.bookmakerId || cfg.activeBookmaker
-    );
-    const client = getBookmakerClient(activeBookmaker);
-    const bookmakerInfo = getBookmakerInfo(activeBookmaker);
+    const client = getBookmakerClient(bookmakerId);
+    const bookmakerInfo = getBookmakerInfo(bookmakerId);
     const uniqueEventIds = Array.from(
       new Set(candidates.flatMap((t) => t.selections.map((s) => s.eventId)))
     );
@@ -5355,12 +6359,12 @@ var SchedulerService = class {
     let rejectedCount = 0;
     let codesCreated = 0;
     let codeFailures = 0;
-    const usedShareCodes = automationStore.getExistingShareCodes();
+    const usedShareCodes = automationStore.getExistingShareCodes(void 0, bookmakerId);
     for (const candidate of candidates) {
       const check = revalidateTicketSelectionsAgainstMatches(
         candidate.selections,
         matchLookup,
-        cfg,
+        { ...cfg, activeBookmaker: bookmakerId },
         nowMs,
         validationOptions
       );
@@ -5373,7 +6377,7 @@ var SchedulerService = class {
       );
       let validatedTicket = {
         ...candidate,
-        bookmakerId: activeBookmaker,
+        bookmakerId,
         bookmakerName: candidate.bookmakerName || bookmakerInfo.name,
         bookmakerUrl: candidate.bookmakerUrl || bookmakerInfo.websiteUrl,
         selections: check.refreshedSelections,
@@ -5383,7 +6387,7 @@ var SchedulerService = class {
         revalidatedAt,
         published: true
       };
-      if (cfg.autoCreateBookingCodes) {
+      if (cfg.autoCreateBookingCodes && bookmakerInfo.bookingCodeSupported) {
         try {
           const booking = await client.createBookingCode(validatedTicket.selections);
           const cleanCode = String(booking.shareCode || "").trim().toUpperCase();
@@ -5398,7 +6402,7 @@ var SchedulerService = class {
             shareCode: booking.shareCode,
             shareUrl: booking.shareUrl,
             shareCodeDeadline: booking.deadline,
-            shareCodeVerified: booking.verified,
+            shareCodeVerified: Boolean(booking.verified),
             bookingCodeStatus: "GENERATED",
             bookingCodeError: null
           };
@@ -5421,14 +6425,26 @@ var SchedulerService = class {
     }
     return { publishedTickets, rejectedCount, codesCreated, codeFailures };
   }
-  async runDailyFactoryJob(manualTrigger = true, actorEmail = null) {
+  /**
+   * Independent per-bookmaker permanent cycle generator.
+   * Strictly enforces Generation Lock & Idempotency:
+   * NEVER generates or overwrites a bookmaker feed while ANY match in its active cycle is unfinished.
+   */
+  async runDailyFactoryForBookmaker(bookmakerId, options) {
+    await this.ensureFirestoreHydrated();
+    const bk = normalizeBookmakerId(bookmakerId);
+    const bkInfo = getBookmakerInfo(bk);
     const startedMs = Date.now();
     const startedAt = new Date(startedMs).toISOString();
-    const cfg = automationStore.getFactoryConfig();
+    const manualTrigger = options?.manualTrigger ?? true;
+    const actorEmail = options?.actorEmail ?? null;
     const actionType = manualTrigger ? "MANUAL_TRIGGER" : "AUTO_SCHEDULE";
-    if (this.factoryLock) {
+    const cfg = automationStore.getFactoryConfig();
+    if (this.bookmakerLocks[bk]) {
       const skippedLog = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+        bookmakerId: bk,
+        cycleId: null,
         actionType,
         jobType: "DAILY_FACTORY",
         status: "SKIPPED",
@@ -5441,14 +6457,23 @@ var SchedulerService = class {
         codeFailures: 0,
         ticketsChecked: 0,
         ticketsSettled: 0,
-        message: "Skipped overlapping Daily Factory execution (active run in progress)."
+        message: `Skipped overlapping ${bkInfo.shortName} generation (run already in progress).`
       };
       automationStore.addLog(skippedLog);
-      return { tickets: [], log: skippedLog, shortfallReason: skippedLog.message };
+      return {
+        bookmakerId: bk,
+        cycleId: null,
+        tickets: [],
+        log: skippedLog,
+        shortfallReason: skippedLog.message,
+        locked: true
+      };
     }
     if (!manualTrigger && (!cfg.enabled || cfg.paused)) {
       const skippedLog = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+        bookmakerId: bk,
+        cycleId: null,
         actionType,
         jobType: "DAILY_FACTORY",
         status: "SKIPPED",
@@ -5461,13 +6486,22 @@ var SchedulerService = class {
         codeFailures: 0,
         ticketsChecked: 0,
         ticketsSettled: 0,
-        message: cfg.paused ? "Daily Factory scheduler is paused by administrator." : "Daily Factory automation is disabled."
+        message: cfg.paused ? `${bkInfo.shortName} Daily Factory scheduler is paused by administrator.` : `${bkInfo.shortName} Daily Factory automation is disabled.`
       };
-      return { tickets: [], log: skippedLog, shortfallReason: null };
+      return {
+        bookmakerId: bk,
+        cycleId: null,
+        tickets: [],
+        log: skippedLog,
+        shortfallReason: null,
+        locked: false
+      };
     }
     if (!manualTrigger && !this.isWithinOperatingWindow(cfg, startedMs)) {
       const skippedLog = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+        bookmakerId: bk,
+        cycleId: null,
         actionType,
         jobType: "DAILY_FACTORY",
         status: "SKIPPED",
@@ -5480,22 +6514,24 @@ var SchedulerService = class {
         codeFailures: 0,
         ticketsChecked: 0,
         ticketsSettled: 0,
-        message: `Outside configured ${cfg.windowStartTime}\u2013${cfg.windowEndTime} ${cfg.timezone} window.`
+        message: `${bkInfo.shortName}: Outside configured ${cfg.windowStartTime}\u2013${cfg.windowEndTime} ${cfg.timezone} window.`
       };
       automationStore.addLog(skippedLog);
-      return { tickets: [], log: skippedLog, shortfallReason: null };
+      return {
+        bookmakerId: bk,
+        cycleId: null,
+        tickets: [],
+        log: skippedLog,
+        shortfallReason: null,
+        locked: false
+      };
     }
-    const counts = this.getSectionCountsToday(cfg.timezone);
-    const upcomingCap = Math.min(cfg.maxTickets, cfg.dailyTicketTarget);
-    const remainingUpcoming = Math.max(0, upcomingCap - counts.upcomingActive);
-    const liveTarget = Math.max(10, cfg.liveFootballTarget ?? 12);
-    const otherTarget = Math.max(10, cfg.otherSportsTarget ?? 12);
-    const remainingLiveFootball = Math.max(0, liveTarget - counts.liveFootballActive);
-    const remainingOtherSports = Math.max(0, otherTarget - counts.otherSportsActive);
-    if (remainingUpcoming <= 0 && remainingLiveFootball <= 0 && remainingOtherSports <= 0) {
-      const msg = `Daily feed targets reached (${counts.upcomingActive}/${upcomingCap} upcoming active, ${counts.liveFootballActive}/${liveTarget} live football, ${counts.otherSportsActive}/${otherTarget} other sports).`;
-      const log = {
+    const currentState = automationStore.recomputeBookmakerState(bk);
+    if (currentState.generationLocked) {
+      const lockedLog = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+        bookmakerId: bk,
+        cycleId: currentState.activeCycleId,
         actionType,
         jobType: "DAILY_FACTORY",
         status: "SKIPPED",
@@ -5506,96 +6542,142 @@ var SchedulerService = class {
         ticketsGenerated: 0,
         codesCreated: 0,
         codeFailures: 0,
-        ticketsChecked: 0,
-        ticketsSettled: 0,
-        message: msg
+        ticketsChecked: currentState.totalTicketsInCycle,
+        ticketsSettled: currentState.settledTicketsInCycle,
+        message: `${bkInfo.shortName} ${currentState.lockReason}`
       };
-      automationStore.addLog(log);
-      automationStore.setFactoryRunMeta(startedAt, null);
-      return { tickets: [], log, shortfallReason: null };
+      automationStore.addLog(lockedLog);
+      return {
+        bookmakerId: bk,
+        cycleId: currentState.activeCycleId,
+        tickets: [],
+        log: lockedLog,
+        shortfallReason: currentState.lockReason,
+        locked: true
+      };
     }
-    this.factoryLock = true;
+    this.bookmakerLocks[bk] = true;
     try {
-      const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
+      const dateKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
+      const bkCycles = automationStore.getFeedCycles(bk);
+      const cycleSeq = bkCycles.length + 1;
+      const prefix = bk === "BETPAWA_TZ" ? "BP" : "SB";
+      const cycleId = `CYC_${prefix}_${dateKey.replace(/-/g, "")}_${String(cycleSeq).padStart(
+        3,
+        "0"
+      )}`;
+      const idempotencyKey = options?.idempotencySuffix ? `${bk}::${dateKey}::seq_${cycleSeq}::${options.idempotencySuffix}` : `${bk}::${dateKey}::seq_${cycleSeq}`;
+      if (automationStore.hasIdempotencyKey(idempotencyKey)) {
+        const dupLog = {
+          logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+          bookmakerId: bk,
+          cycleId,
+          actionType,
+          jobType: "DAILY_FACTORY",
+          status: "SKIPPED",
+          actorEmail,
+          startedAt,
+          finishedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          durationMs: Date.now() - startedMs,
+          ticketsGenerated: 0,
+          codesCreated: 0,
+          codeFailures: 0,
+          ticketsChecked: 0,
+          ticketsSettled: 0,
+          message: `Skipped duplicate generation for ${bkInfo.shortName} (idempotencyKey=${idempotencyKey}).`
+        };
+        automationStore.addLog(dupLog);
+        return {
+          bookmakerId: bk,
+          cycleId,
+          tickets: [],
+          log: dupLog,
+          shortfallReason: dupLog.message,
+          locked: false
+        };
+      }
       const sourceType = manualTrigger ? "ADMIN_MANUAL" : "DAILY_FACTORY";
-      const existingSignatures = cfg.duplicatePrevention ? automationStore.getExistingSignatures() : /* @__PURE__ */ new Set();
-      const allSaved = [];
+      const existingSignatures = cfg.duplicatePrevention ? automationStore.getExistingSignatures(bk) : /* @__PURE__ */ new Set();
+      const upcomingTarget = Math.min(cfg.maxTickets, cfg.dailyTicketTarget);
+      const liveTarget = Math.max(10, cfg.liveFootballTarget ?? 12);
+      const otherTarget = bk === "BETPAWA_TZ" ? 0 : Math.max(10, cfg.otherSportsTarget ?? 12);
+      const candidatePool = [];
       let totalCodesCreated = 0;
       let totalCodeFailures = 0;
       const shortfallNotes = [];
-      if (remainingUpcoming > 0) {
-        const upcomingMatches = await fetchUpcomingMatchesForFactory(cfg);
+      if (upcomingTarget > 0) {
+        const upcomingMatches = await fetchUpcomingMatchesForFactory(cfg, bk);
         automationStore.setScanningAt((/* @__PURE__ */ new Date()).toISOString());
-        const { eventIds: existingEventIds, teamKeys: existingTeamKeys } = automationStore.getExistingEventAndTeamUsage(todayKey, "UPCOMING");
         const generated = generateDailyPortfolioFromMatches({
           matches: upcomingMatches,
           config: cfg,
-          targetCount: remainingUpcoming,
+          targetCount: upcomingTarget,
+          bookmakerId: bk,
+          cycleId,
+          idempotencyKey,
           sourceType,
           feedSection: "UPCOMING",
           existingSignatures,
-          existingEventIds,
-          existingTeamKeys,
           nowMs: Date.now()
         });
-        const { publishedTickets, codesCreated, codeFailures } = await this.revalidateAndPublishTickets(generated.tickets, cfg);
-        const saved = automationStore.addTickets(publishedTickets);
-        saved.forEach((t) => existingSignatures.add(t.signature));
-        allSaved.push(...saved);
+        const { publishedTickets, codesCreated, codeFailures } = await this.revalidateAndPublishTickets(generated.tickets, cfg, bk);
+        publishedTickets.forEach((t) => existingSignatures.add(t.signature));
+        candidatePool.push(...publishedTickets);
         totalCodesCreated += codesCreated;
         totalCodeFailures += codeFailures;
         if (generated.shortfallReason) shortfallNotes.push(`Upcoming: ${generated.shortfallReason}`);
       }
-      if (remainingLiveFootball > 0) {
-        const liveMatches = await fetchLiveFootballMatchesForFactory(cfg);
+      if (liveTarget > 0) {
+        const liveMatches = await fetchLiveFootballMatchesForFactory(cfg, bk);
         automationStore.setScanningAt((/* @__PURE__ */ new Date()).toISOString());
-        const { eventIds: liveEvIds, teamKeys: liveTeamKeys } = automationStore.getExistingEventAndTeamUsage(todayKey, "LIVE_FOOTBALL");
         const generatedLive = generateDailyPortfolioFromMatches({
           matches: liveMatches,
           config: cfg,
-          targetCount: remainingLiveFootball,
+          targetCount: liveTarget,
+          bookmakerId: bk,
+          cycleId,
+          idempotencyKey,
           sourceType,
           feedSection: "LIVE_FOOTBALL",
           allowLive: true,
           ignoreScheduleWindow: true,
           existingSignatures,
-          existingEventIds: liveEvIds,
-          existingTeamKeys: liveTeamKeys,
           nowMs: Date.now()
         });
-        const { publishedTickets, codesCreated, codeFailures } = await this.revalidateAndPublishTickets(generatedLive.tickets, cfg, { allowLive: true });
-        const saved = automationStore.addTickets(publishedTickets);
-        saved.forEach((t) => existingSignatures.add(t.signature));
-        allSaved.push(...saved);
+        const { publishedTickets, codesCreated, codeFailures } = await this.revalidateAndPublishTickets(generatedLive.tickets, cfg, bk, {
+          allowLive: true
+        });
+        publishedTickets.forEach((t) => existingSignatures.add(t.signature));
+        candidatePool.push(...publishedTickets);
         totalCodesCreated += codesCreated;
         totalCodeFailures += codeFailures;
         if (generatedLive.shortfallReason) {
           shortfallNotes.push(`Live Football: ${generatedLive.shortfallReason}`);
         }
       }
-      if (remainingOtherSports > 0) {
-        const otherMatches = await fetchOtherSportsMatchesForFactory(cfg);
+      if (otherTarget > 0) {
+        const otherMatches = await fetchOtherSportsMatchesForFactory(cfg, bk);
         automationStore.setScanningAt((/* @__PURE__ */ new Date()).toISOString());
-        const { eventIds: otherEvIds, teamKeys: otherTeamKeys } = automationStore.getExistingEventAndTeamUsage(todayKey, "OTHER_SPORTS");
         const generatedOther = generateDailyPortfolioFromMatches({
           matches: otherMatches,
           config: cfg,
-          targetCount: remainingOtherSports,
+          targetCount: otherTarget,
+          bookmakerId: bk,
+          cycleId,
+          idempotencyKey,
           sourceType,
           feedSection: "OTHER_SPORTS",
           allowBothLiveAndUpcoming: true,
           ignoreScheduleWindow: true,
           skipMarketFilter: true,
           existingSignatures,
-          existingEventIds: otherEvIds,
-          existingTeamKeys: otherTeamKeys,
           nowMs: Date.now()
         });
-        const { publishedTickets, codesCreated, codeFailures } = await this.revalidateAndPublishTickets(generatedOther.tickets, cfg, {
+        const { publishedTickets, codesCreated, codeFailures } = await this.revalidateAndPublishTickets(generatedOther.tickets, cfg, bk, {
           allowBothLiveAndUpcoming: true
         });
-        const saved = automationStore.addTickets(publishedTickets);
-        allSaved.push(...saved);
+        publishedTickets.forEach((t) => existingSignatures.add(t.signature));
+        candidatePool.push(...publishedTickets);
         totalCodesCreated += codesCreated;
         totalCodeFailures += codeFailures;
         if (generatedOther.shortfallReason) {
@@ -5604,33 +6686,142 @@ var SchedulerService = class {
       }
       const finishedAt = (/* @__PURE__ */ new Date()).toISOString();
       const combinedShortfall = shortfallNotes.length > 0 ? shortfallNotes.join(" ") : null;
+      if (candidatePool.length === 0) {
+        automationStore.setFactoryRunMeta(finishedAt, combinedShortfall);
+        const emptyLog = {
+          logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+          bookmakerId: bk,
+          cycleId: null,
+          actionType,
+          jobType: "DAILY_FACTORY",
+          status: "PARTIAL",
+          actorEmail,
+          startedAt,
+          finishedAt,
+          durationMs: Date.now() - startedMs,
+          ticketsGenerated: 0,
+          codesCreated: 0,
+          codeFailures: 0,
+          ticketsChecked: 0,
+          ticketsSettled: 0,
+          message: `${bkInfo.shortName}: No qualifying tickets published for cycle ${cycleId}. ${combinedShortfall || ""}`.trim()
+        };
+        automationStore.addLog(emptyLog);
+        return {
+          bookmakerId: bk,
+          cycleId: null,
+          tickets: [],
+          log: emptyLog,
+          shortfallReason: combinedShortfall,
+          locked: false
+        };
+      }
+      const lockEval = evaluateBookmakerCycleLock({
+        bookmakerId: bk,
+        activeCycle: null,
+        cycleTickets: candidatePool,
+        verificationFailures: []
+      });
+      const newCycle = {
+        cycleId,
+        idempotencyKey,
+        bookmakerId: bk,
+        dateKey,
+        status: "ACTIVE",
+        generationLocked: true,
+        ticketIds: candidatePool.map((t) => t.internalTicketId),
+        ticketCount: candidatePool.length,
+        totalMatches: lockEval.totalMatchesInCycle,
+        finishedMatches: lockEval.finishedMatchesCount,
+        unfinishedMatches: lockEval.unfinishedMatchesCount,
+        wonTickets: 0,
+        lostTickets: 0,
+        voidTickets: 0,
+        createdAt: finishedAt,
+        updatedAt: finishedAt,
+        settledAt: null
+      };
+      const registered = automationStore.registerCycleAndTickets({
+        cycle: newCycle,
+        newTickets: candidatePool,
+        generationTimestamp: finishedAt
+      });
+      if (registered.skippedReason || registered.inserted.length === 0) {
+        const skipLog = {
+          logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+          bookmakerId: bk,
+          cycleId,
+          actionType,
+          jobType: "DAILY_FACTORY",
+          status: "SKIPPED",
+          actorEmail,
+          startedAt,
+          finishedAt,
+          durationMs: Date.now() - startedMs,
+          ticketsGenerated: 0,
+          codesCreated: 0,
+          codeFailures: 0,
+          ticketsChecked: 0,
+          ticketsSettled: 0,
+          message: registered.skippedReason || `Skipped duplicate ${bkInfo.shortName} cycle.`
+        };
+        automationStore.addLog(skipLog);
+        return {
+          bookmakerId: bk,
+          cycleId,
+          tickets: [],
+          log: skipLog,
+          shortfallReason: skipLog.message,
+          locked: automationStore.getFeedState(bk).generationLocked
+        };
+      }
+      const nextFeedState = automationStore.getFeedState(bk);
+      await firebaseAdminBridge.commitGenerationCycleTransaction({
+        cycle: registered.cycle,
+        tickets: registered.inserted,
+        feedState: nextFeedState,
+        dailyTicketTarget: cfg.dailyTicketTarget
+      });
       automationStore.setFactoryRunMeta(finishedAt, combinedShortfall);
-      const upCount = allSaved.filter((t) => (t.feedSection || "UPCOMING") === "UPCOMING").length;
-      const lfCount = allSaved.filter((t) => t.feedSection === "LIVE_FOOTBALL").length;
-      const osCount = allSaved.filter((t) => t.feedSection === "OTHER_SPORTS").length;
+      const upCount = registered.inserted.filter(
+        (t) => (t.feedSection || "UPCOMING") === "UPCOMING"
+      ).length;
+      const lfCount = registered.inserted.filter((t) => t.feedSection === "LIVE_FOOTBALL").length;
+      const osCount = registered.inserted.filter((t) => t.feedSection === "OTHER_SPORTS").length;
       const log = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+        bookmakerId: bk,
+        cycleId: registered.cycle.cycleId,
         actionType,
         jobType: "DAILY_FACTORY",
-        status: combinedShortfall && allSaved.length === 0 ? "PARTIAL" : combinedShortfall ? "PARTIAL" : "SUCCESS",
+        status: combinedShortfall ? "PARTIAL" : "SUCCESS",
         actorEmail,
         startedAt,
         finishedAt,
         durationMs: Date.now() - startedMs,
-        ticketsGenerated: allSaved.length,
+        ticketsGenerated: registered.inserted.length,
         codesCreated: totalCodesCreated,
         codeFailures: totalCodeFailures,
         ticketsChecked: 0,
         ticketsSettled: 0,
-        message: `Published ${allSaved.length} card(s) (${upCount} upcoming, ${lfCount} live football, ${osCount} other games; ${totalCodesCreated} genuine booking codes, ${totalCodeFailures} failures).${combinedShortfall ? ` ${combinedShortfall}` : ""}`
+        message: `[${bkInfo.shortName} \u2022 ${registered.cycle.cycleId}] Published ${registered.inserted.length} permanent card(s) (${upCount} upcoming, ${lfCount} live football, ${osCount} other games; ${totalCodesCreated} booking codes, ${totalCodeFailures} failures). Generation LOCKED until all ${registered.cycle.totalMatches} match selections settle.${combinedShortfall ? ` ${combinedShortfall}` : ""}`
       };
       automationStore.addLog(log);
-      return { tickets: allSaved, log, shortfallReason: combinedShortfall };
+      return {
+        bookmakerId: bk,
+        cycleId: registered.cycle.cycleId,
+        tickets: registered.inserted,
+        log,
+        shortfallReason: combinedShortfall,
+        locked: nextFeedState.generationLocked
+      };
     } catch (err) {
       const finishedAt = (/* @__PURE__ */ new Date()).toISOString();
-      const errMsg = err instanceof Error ? err.message : "Daily Factory job failed";
+      const errMsg = err instanceof Error ? err.message : `${bkInfo.shortName} Daily Factory failed`;
       const log = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+        bookmakerId: bk,
+        cycleId: null,
         actionType,
         jobType: "DAILY_FACTORY",
         status: "FAILED",
@@ -5643,144 +6834,89 @@ var SchedulerService = class {
         codeFailures: 0,
         ticketsChecked: 0,
         ticketsSettled: 0,
-        message: errMsg
+        message: `[${bkInfo.shortName}] ${errMsg}`
       };
       automationStore.addLog(log);
-      return { tickets: [], log, shortfallReason: errMsg };
+      return {
+        bookmakerId: bk,
+        cycleId: null,
+        tickets: [],
+        log,
+        shortfallReason: errMsg,
+        locked: automationStore.getFeedState(bk).generationLocked
+      };
     } finally {
-      this.factoryLock = false;
+      this.bookmakerLocks[bk] = false;
     }
   }
   /**
-   * Automatically creates fresh replacement codes whenever existing codes finish (WON / LOST / VOID),
-   * preserving settled tickets in the feed untouched.
+   * Orchestrates permanent feed generation either for one requested bookmaker or BOTH bookmakers independently.
+   * When running automatically (cron / timer), checks results FIRST so settled cycles unlock before generating.
    */
-  async replenishAfterSettlement(params) {
-    const { settledUpcomingTickets, settledLiveFootball, settledOtherSports, cfg, actorEmail } = params;
-    if (cfg.autoReplenishOnSettle === false) return [];
-    if (this.factoryLock) return [];
-    const liveTarget = Math.max(10, cfg.liveFootballTarget ?? 12);
-    const otherTarget = Math.max(10, cfg.otherSportsTarget ?? 12);
-    const counts = this.getSectionCountsToday(cfg.timezone);
-    const upcomingNeed = settledUpcomingTickets.length;
-    const liveNeed = settledLiveFootball > 0 ? Math.max(0, liveTarget - counts.liveFootballActive) : 0;
-    const otherNeed = settledOtherSports > 0 ? Math.max(0, otherTarget - counts.otherSportsActive) : 0;
-    if (upcomingNeed <= 0 && liveNeed <= 0 && otherNeed <= 0) {
-      return [];
+  async runDailyFactoryJob(manualTrigger = true, actorEmail = null, targetBookmaker) {
+    await this.ensureFirestoreHydrated();
+    if (!manualTrigger) {
+      await this.runResultsTrackingJob(false, void 0, actorEmail, {
+        targetBookmaker
+      });
     }
-    this.factoryLock = true;
-    const replenished = [];
-    try {
-      const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
-      const existingSignatures = cfg.duplicatePrevention ? automationStore.getExistingSignatures() : /* @__PURE__ */ new Set();
-      if (upcomingNeed > 0) {
-        const upcomingMatches = await fetchUpcomingMatchesForFactory(cfg);
-        const { eventIds, teamKeys } = automationStore.getExistingEventAndTeamUsage(
-          todayKey,
-          "UPCOMING"
-        );
-        const generated = generateDailyPortfolioFromMatches({
-          matches: upcomingMatches,
-          config: cfg,
-          targetCount: upcomingNeed,
-          sourceType: "DAILY_FACTORY",
-          feedSection: "UPCOMING",
-          replacedTicketId: settledUpcomingTickets[0]?.internalTicketId || null,
-          existingSignatures,
-          existingEventIds: eventIds,
-          existingTeamKeys: teamKeys,
-          nowMs: Date.now()
-        });
-        const tagged = generated.tickets.map((t, idx) => ({
-          ...t,
-          replacedTicketId: settledUpcomingTickets[idx]?.internalTicketId || settledUpcomingTickets[0]?.internalTicketId || null
-        }));
-        const { publishedTickets } = await this.revalidateAndPublishTickets(tagged, cfg);
-        const saved = automationStore.addTickets(publishedTickets);
-        saved.forEach((t) => existingSignatures.add(t.signature));
-        replenished.push(...saved);
-      }
-      if (liveNeed > 0) {
-        const liveMatches = await fetchLiveFootballMatchesForFactory(cfg);
-        const { eventIds, teamKeys } = automationStore.getExistingEventAndTeamUsage(
-          todayKey,
-          "LIVE_FOOTBALL"
-        );
-        const generatedLive = generateDailyPortfolioFromMatches({
-          matches: liveMatches,
-          config: cfg,
-          targetCount: liveNeed,
-          sourceType: "DAILY_FACTORY",
-          feedSection: "LIVE_FOOTBALL",
-          allowLive: true,
-          ignoreScheduleWindow: true,
-          existingSignatures,
-          existingEventIds: eventIds,
-          existingTeamKeys: teamKeys,
-          nowMs: Date.now()
-        });
-        const { publishedTickets } = await this.revalidateAndPublishTickets(
-          generatedLive.tickets,
-          cfg,
-          { allowLive: true }
-        );
-        const saved = automationStore.addTickets(publishedTickets);
-        saved.forEach((t) => existingSignatures.add(t.signature));
-        replenished.push(...saved);
-      }
-      if (otherNeed > 0) {
-        const otherMatches = await fetchOtherSportsMatchesForFactory(cfg);
-        const { eventIds, teamKeys } = automationStore.getExistingEventAndTeamUsage(
-          todayKey,
-          "OTHER_SPORTS"
-        );
-        const generatedOther = generateDailyPortfolioFromMatches({
-          matches: otherMatches,
-          config: cfg,
-          targetCount: otherNeed,
-          sourceType: "DAILY_FACTORY",
-          feedSection: "OTHER_SPORTS",
-          allowBothLiveAndUpcoming: true,
-          ignoreScheduleWindow: true,
-          skipMarketFilter: true,
-          existingSignatures,
-          existingEventIds: eventIds,
-          existingTeamKeys: teamKeys,
-          nowMs: Date.now()
-        });
-        const { publishedTickets } = await this.revalidateAndPublishTickets(
-          generatedOther.tickets,
-          cfg,
-          { allowBothLiveAndUpcoming: true }
-        );
-        const saved = automationStore.addTickets(publishedTickets);
-        replenished.push(...saved);
-      }
-      if (replenished.length > 0) {
-        const nowIso = (/* @__PURE__ */ new Date()).toISOString();
-        automationStore.addLog({
-          logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
-          actionType: "AUTO_SCHEDULE",
-          jobType: "DAILY_FACTORY",
-          status: "SUCCESS",
-          actorEmail,
-          startedAt: nowIso,
-          finishedAt: nowIso,
-          durationMs: 0,
-          ticketsGenerated: replenished.length,
-          codesCreated: replenished.filter((t) => t.bookingCodeStatus === "GENERATED").length,
-          codeFailures: replenished.filter((t) => t.bookingCodeStatus === "FAILED").length,
-          ticketsChecked: 0,
-          ticketsSettled: 0,
-          message: `Auto-generated ${replenished.length} replacement code(s) after active daily codes settled.`
-        });
-      }
-      return replenished;
-    } catch {
-      return replenished;
-    } finally {
-      this.factoryLock = false;
+    const targets = targetBookmaker ? [normalizeBookmakerId(targetBookmaker)] : ALL_BOOKMAKERS;
+    const results = [];
+    for (const bk of targets) {
+      const res = await this.runDailyFactoryForBookmaker(bk, {
+        manualTrigger,
+        actorEmail
+      });
+      results.push(res);
     }
+    const combinedTickets = results.flatMap((r) => r.tickets);
+    const shortfalls = results.map((r) => r.shortfallReason).filter((s) => Boolean(s));
+    const byBookmakerSummary = {
+      SPORTYBET_TZ: {
+        cycleId: automationStore.getFeedState("SPORTYBET_TZ").activeCycleId,
+        ticketsGenerated: 0,
+        locked: automationStore.getFeedState("SPORTYBET_TZ").generationLocked,
+        message: automationStore.getFeedState("SPORTYBET_TZ").lockReason
+      },
+      BETPAWA_TZ: {
+        cycleId: automationStore.getFeedState("BETPAWA_TZ").activeCycleId,
+        ticketsGenerated: 0,
+        locked: automationStore.getFeedState("BETPAWA_TZ").generationLocked,
+        message: automationStore.getFeedState("BETPAWA_TZ").lockReason
+      }
+    };
+    for (const r of results) {
+      byBookmakerSummary[r.bookmakerId] = {
+        cycleId: r.cycleId,
+        ticketsGenerated: r.tickets.length,
+        locked: r.locked,
+        message: r.log.message
+      };
+    }
+    const primaryLog = results.length === 1 ? results[0].log : {
+      logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
+      bookmakerId: "ALL",
+      cycleId: null,
+      actionType: manualTrigger ? "MANUAL_TRIGGER" : "AUTO_SCHEDULE",
+      jobType: "DAILY_FACTORY",
+      status: combinedTickets.length > 0 ? "SUCCESS" : "SKIPPED",
+      actorEmail,
+      startedAt: results[0]?.log.startedAt || (/* @__PURE__ */ new Date()).toISOString(),
+      finishedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      durationMs: results.reduce((sum, r) => sum + r.log.durationMs, 0),
+      ticketsGenerated: combinedTickets.length,
+      codesCreated: results.reduce((sum, r) => sum + r.log.codesCreated, 0),
+      codeFailures: results.reduce((sum, r) => sum + r.log.codeFailures, 0),
+      ticketsChecked: results.reduce((sum, r) => sum + r.log.ticketsChecked, 0),
+      ticketsSettled: results.reduce((sum, r) => sum + r.log.ticketsSettled, 0),
+      message: results.map((r) => r.log.message).join(" | ")
+    };
+    return {
+      tickets: combinedTickets,
+      log: primaryLog,
+      shortfallReason: shortfalls.length > 0 ? shortfalls.join(" | ") : null,
+      byBookmaker: byBookmakerSummary
+    };
   }
   async retryFailedBookingCodes(ticketIds, actorEmail = null) {
     const startedMs = Date.now();
@@ -5790,15 +6926,19 @@ var SchedulerService = class {
       if (ticketIds && ticketIds.length > 0 && !ticketIds.includes(t.internalTicketId)) {
         return false;
       }
-      return !isTerminal(t.status) && (!t.shareCode || t.bookingCodeStatus === "FAILED" || t.bookingCodeStatus === "NOT_REQUESTED");
+      return !isTicketTerminalStatus(t.status) && (!t.shareCode || t.bookingCodeStatus === "FAILED" || t.bookingCodeStatus === "NOT_REQUESTED");
     });
     let codesCreated = 0;
     let codeFailures = 0;
-    const usedShareCodes = automationStore.getExistingShareCodes();
+    const updatedTickets = [];
     for (const ticket of targets) {
       const ticketBookmaker = normalizeBookmakerId(ticket.bookmakerId);
       const client = getBookmakerClient(ticketBookmaker);
       const bookmakerInfo = getBookmakerInfo(ticketBookmaker);
+      const usedShareCodes = automationStore.getExistingShareCodes(
+        ticket.internalTicketId,
+        ticketBookmaker
+      );
       try {
         const booking = await client.createBookingCode(ticket.selections);
         const cleanCode = String(booking.shareCode || "").trim().toUpperCase();
@@ -5807,28 +6947,37 @@ var SchedulerService = class {
             cleanCode ? `Duplicate booking code ${cleanCode} rejected to preserve unique card codes.` : `${bookmakerInfo.shortName} returned an empty booking code.`
           );
         }
-        usedShareCodes.add(cleanCode);
-        automationStore.updateTicketMutableFields({
+        const saved = automationStore.updateTicketMutableFields({
           ...ticket,
           shareCode: booking.shareCode,
           shareUrl: booking.shareUrl,
           shareCodeDeadline: booking.deadline,
-          shareCodeVerified: booking.verified,
+          shareCodeVerified: Boolean(booking.verified),
           bookingCodeStatus: "GENERATED",
           bookingCodeError: null,
           lastCheckedAt: (/* @__PURE__ */ new Date()).toISOString()
         });
+        if (saved) updatedTickets.push(saved);
         codesCreated++;
         await sleep(80);
       } catch (err) {
         codeFailures++;
-        automationStore.updateTicketMutableFields({
+        const saved = automationStore.updateTicketMutableFields({
           ...ticket,
           bookingCodeStatus: "FAILED",
           bookingCodeError: err instanceof Error ? err.message : `${bookmakerInfo.shortName} booking code API failed`,
           lastCheckedAt: (/* @__PURE__ */ new Date()).toISOString()
         });
+        if (saved) updatedTickets.push(saved);
       }
+    }
+    if (updatedTickets.length > 0) {
+      await firebaseAdminBridge.syncSettlementState({
+        updatedTickets,
+        matchResults: [],
+        cycles: [],
+        feedStates: automationStore.getFeedStates()
+      });
     }
     const log = {
       logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
@@ -5855,13 +7004,21 @@ var SchedulerService = class {
       log
     };
   }
-  async runResultsTrackingJob(manualTrigger = true, ticketIds, actorEmail = null) {
+  /**
+   * Automatic ticket & match result tracker.
+   * Tracks all non-terminal tickets AND any LOST tickets that still have unfinished match selections
+   * so generation locks accurately reflect true completion of every match in each bookmaker's cycle.
+   */
+  async runResultsTrackingJob(manualTrigger = true, ticketIds, actorEmail = null, options) {
+    await this.ensureFirestoreHydrated();
     const startedMs = Date.now();
     const startedAt = new Date(startedMs).toISOString();
+    const actionType = options?.retryFailedOnly ? "RETRY_RESULTS" : "RESULTS_CHECK";
     if (this.resultsLock) {
       const skippedLog = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
-        actionType: "RESULTS_CHECK",
+        bookmakerId: options?.targetBookmaker || "ALL",
+        actionType,
         jobType: "RESULTS_TRACKER",
         status: "SKIPPED",
         actorEmail,
@@ -5875,24 +7032,48 @@ var SchedulerService = class {
         ticketsSettled: 0,
         message: "Results tracker already running."
       };
-      return { updatedTickets: [], replenishedTickets: [], log: skippedLog };
+      return {
+        updatedTickets: [],
+        replenishedTickets: [],
+        unlockedBookmakers: [],
+        log: skippedLog
+      };
     }
     this.resultsLock = true;
     try {
-      const cfg = automationStore.getFactoryConfig();
-      const allTickets = automationStore.getTickets();
+      const targetBk = options?.targetBookmaker ? normalizeBookmakerId(options.targetBookmaker) : void 0;
+      const failedEventIds = options?.retryFailedOnly ? new Set(automationStore.getVerificationFailures(targetBk).map((f) => f.eventId)) : null;
+      const prevLockSnapshot = {
+        SPORTYBET_TZ: automationStore.getFeedState("SPORTYBET_TZ").generationLocked,
+        BETPAWA_TZ: automationStore.getFeedState("BETPAWA_TZ").generationLocked
+      };
+      const allTickets = automationStore.getTickets(targetBk);
       const targetTickets = allTickets.filter((t) => {
         if (ticketIds && ticketIds.length > 0 && !ticketIds.includes(t.internalTicketId)) {
           return false;
         }
-        return !isTerminal(t.status);
+        if (failedEventIds && failedEventIds.size > 0) {
+          const touchesFailedEvent = t.selections.some((s) => failedEventIds.has(s.eventId));
+          if (!touchesFailedEvent) return false;
+        }
+        if (!isTicketTerminalStatus(t.status)) return true;
+        if (t.status === "LOST") {
+          const progress = computeTicketMatchProgress(t);
+          return progress.unfinishedMatchCount > 0;
+        }
+        return false;
       });
       if (targetTickets.length === 0) {
         const finishedAt2 = (/* @__PURE__ */ new Date()).toISOString();
-        automationStore.setResultsRunAt(finishedAt2);
+        const states = automationStore.recomputeAllBookmakerStates();
+        automationStore.setResultsRunAt(finishedAt2, targetBk ? [targetBk] : ALL_BOOKMAKERS);
+        const unlockedBookmakers2 = ALL_BOOKMAKERS.filter(
+          (bk) => prevLockSnapshot[bk] && !states[bk].generationLocked
+        );
         const log2 = {
           logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
-          actionType: "RESULTS_CHECK",
+          bookmakerId: targetBk || "ALL",
+          actionType,
           jobType: "RESULTS_TRACKER",
           status: manualTrigger ? "SUCCESS" : "SKIPPED",
           actorEmail,
@@ -5904,10 +7085,15 @@ var SchedulerService = class {
           codeFailures: 0,
           ticketsChecked: 0,
           ticketsSettled: 0,
-          message: "No active pending or live tickets require settlement verification."
+          message: options?.retryFailedOnly ? "No failed or unfinished result checks pending verification." : "No unfinished match selections require verification."
         };
         if (manualTrigger) automationStore.addLog(log2);
-        return { updatedTickets: [], replenishedTickets: [], log: log2 };
+        return {
+          updatedTickets: [],
+          replenishedTickets: [],
+          unlockedBookmakers: unlockedBookmakers2,
+          log: log2
+        };
       }
       const ticketsByBookmaker = /* @__PURE__ */ new Map();
       for (const ticket of targetTickets) {
@@ -5917,16 +7103,25 @@ var SchedulerService = class {
         ticketsByBookmaker.set(bk, arr);
       }
       const updatedTickets = [];
-      const newlySettledUpcoming = [];
-      let settledLiveFootball = 0;
-      let settledOtherSports = 0;
-      let settledCount = 0;
+      const newMatchResults = [];
+      let newlySettledTicketCount = 0;
       let totalUniqueEvents = 0;
+      let verificationErrorCount = 0;
       for (const [bkId, bkTickets] of ticketsByBookmaker.entries()) {
         const client = getBookmakerClient(bkId);
-        const bkEventIds = Array.from(
-          new Set(bkTickets.flatMap((t) => t.selections.map((s) => s.eventId)))
-        );
+        const eventTicketMap = /* @__PURE__ */ new Map();
+        for (const t of bkTickets) {
+          for (const sel of t.selections) {
+            const entry = eventTicketMap.get(sel.eventId) || {
+              ticketIds: [],
+              homeTeam: sel.homeTeam,
+              awayTeam: sel.awayTeam
+            };
+            entry.ticketIds.push(t.internalTicketId);
+            eventTicketMap.set(sel.eventId, entry);
+          }
+        }
+        const bkEventIds = Array.from(eventTicketMap.keys());
         totalUniqueEvents += bkEventIds.length;
         const matchLookup = /* @__PURE__ */ new Map();
         try {
@@ -5944,70 +7139,104 @@ var SchedulerService = class {
               try {
                 const details = await client.getMatchDetails(eventId);
                 matchLookup.set(eventId, details);
-              } catch {
+                automationStore.clearVerificationFailure(bkId, eventId);
+              } catch (err) {
                 matchLookup.set(eventId, null);
+                const meta = eventTicketMap.get(eventId);
+                verificationErrorCount++;
+                automationStore.recordVerificationFailure({
+                  bookmakerId: bkId,
+                  eventId,
+                  ticketIds: meta?.ticketIds || [],
+                  homeTeam: meta?.homeTeam || "Match",
+                  awayTeam: meta?.awayTeam || eventId,
+                  error: err instanceof Error ? err.message : "Match verification API failed"
+                });
               }
             })
           );
         }
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
         for (const ticket of bkTickets) {
-          const evaluated = evaluateTicketSettlement(ticket, matchLookup, Date.now());
-          const reachedTerminal = isTerminal(evaluated.status);
-          if (reachedTerminal) {
-            settledCount++;
+          const wasTerminal = isTicketTerminalStatus(ticket.status);
+          const evaluated = evaluateTicketSettlement(ticket, matchLookup, nowMs);
+          if (!wasTerminal && isTicketTerminalStatus(evaluated.status)) {
+            newlySettledTicketCount++;
           }
           const saved = automationStore.updateTicketMutableFields(evaluated);
           if (saved) {
             updatedTickets.push(saved);
-            if (reachedTerminal) {
-              const sec = saved.feedSection || "UPCOMING";
-              if (sec === "LIVE_FOOTBALL") {
-                settledLiveFootball++;
-              } else if (sec === "OTHER_SPORTS") {
-                settledOtherSports++;
-              } else {
-                newlySettledUpcoming.push(saved);
-              }
+            for (const sel of saved.selections) {
+              const ss = saved.selectionSettlements.find(
+                (s) => s.selectionKey === sel.selectionKey
+              );
+              if (!ss) continue;
+              newMatchResults.push({
+                resultId: `${bkId}__${sel.eventId}`.replace(/[^a-zA-Z0-9_\-]/g, "_"),
+                bookmakerId: bkId,
+                eventId: sel.eventId,
+                homeTeam: sel.homeTeam,
+                awayTeam: sel.awayTeam,
+                officialMatchStatus: ss.officialMatchStatus || "",
+                status: ss.status,
+                score: ss.score || "",
+                verified: isSelectionTerminalStatus(ss.status),
+                reason: ss.reason || "",
+                updatedAt: nowIso
+              });
             }
           }
         }
       }
-      let replenishedTickets = [];
-      if (settledCount > 0 && cfg.autoReplenishOnSettle !== false) {
-        replenishedTickets = await this.replenishAfterSettlement({
-          settledUpcomingTickets: newlySettledUpcoming,
-          settledLiveFootball,
-          settledOtherSports,
-          cfg,
-          actorEmail
-        });
-      }
+      automationStore.upsertMatchResults(newMatchResults);
+      const nextStates = automationStore.recomputeAllBookmakerStates();
       const finishedAt = (/* @__PURE__ */ new Date()).toISOString();
-      automationStore.setResultsRunAt(finishedAt);
+      automationStore.setResultsRunAt(
+        finishedAt,
+        Array.from(ticketsByBookmaker.keys())
+      );
+      const unlockedBookmakers = ALL_BOOKMAKERS.filter(
+        (bk) => prevLockSnapshot[bk] && !nextStates[bk].generationLocked
+      );
       const log = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
-        actionType: "RESULTS_CHECK",
+        bookmakerId: targetBk || "ALL",
+        actionType,
         jobType: "RESULTS_TRACKER",
-        status: "SUCCESS",
+        status: verificationErrorCount > 0 ? "PARTIAL" : "SUCCESS",
         actorEmail,
         startedAt,
         finishedAt,
         durationMs: Date.now() - startedMs,
-        ticketsGenerated: replenishedTickets.length,
-        codesCreated: replenishedTickets.filter((t) => t.bookingCodeStatus === "GENERATED").length,
-        codeFailures: replenishedTickets.filter((t) => t.bookingCodeStatus === "FAILED").length,
+        ticketsGenerated: 0,
+        codesCreated: 0,
+        codeFailures: 0,
         ticketsChecked: updatedTickets.length,
-        ticketsSettled: settledCount,
-        message: `Checked ${updatedTickets.length} active ticket(s) across ${totalUniqueEvents} event(s); settled ${settledCount}.${replenishedTickets.length > 0 ? ` Auto-generated ${replenishedTickets.length} fresh replacement code(s).` : ""}`
+        ticketsSettled: newlySettledTicketCount,
+        message: `Checked ${updatedTickets.length} ticket(s) across ${totalUniqueEvents} event(s); settled ${newlySettledTicketCount}.${unlockedBookmakers.length > 0 ? ` Cycle UNLOCKED for: ${unlockedBookmakers.map((b) => getBookmakerInfo(b).shortName).join(", ")}.` : ""}${verificationErrorCount > 0 ? ` ${verificationErrorCount} event verification error(s) queued for safe retry.` : ""}`
       };
       automationStore.addLog(log);
-      return { updatedTickets, replenishedTickets, log };
+      await firebaseAdminBridge.syncSettlementState({
+        updatedTickets,
+        matchResults: newMatchResults,
+        cycles: automationStore.getFeedCycles(),
+        feedStates: nextStates,
+        log
+      });
+      return {
+        updatedTickets,
+        replenishedTickets: [],
+        unlockedBookmakers,
+        log
+      };
     } catch (err) {
       const finishedAt = (/* @__PURE__ */ new Date()).toISOString();
       const errMsg = err instanceof Error ? err.message : "Results tracking failed";
       const log = {
         logId: `log_${crypto6.randomBytes(4).toString("hex")}`,
-        actionType: "RESULTS_CHECK",
+        bookmakerId: options?.targetBookmaker || "ALL",
+        actionType,
         jobType: "RESULTS_TRACKER",
         status: "FAILED",
         actorEmail,
@@ -6022,10 +7251,21 @@ var SchedulerService = class {
         message: errMsg
       };
       automationStore.addLog(log);
-      return { updatedTickets: [], replenishedTickets: [], log };
+      return {
+        updatedTickets: [],
+        replenishedTickets: [],
+        unlockedBookmakers: [],
+        log
+      };
     } finally {
       this.resultsLock = false;
     }
+  }
+  async retryFailedResultChecks(targetBookmaker, actorEmail = null) {
+    return this.runResultsTrackingJob(true, void 0, actorEmail, {
+      targetBookmaker,
+      retryFailedOnly: true
+    });
   }
 };
 var schedulerService = new SchedulerService();
@@ -6427,8 +7667,10 @@ async function getPublicTicketById(req, res) {
   }
   res.json({ ticket });
 }
-async function getPerformanceAnalytics(_req, res) {
-  const tickets = automationStore.getTickets();
+async function getPerformanceAnalytics(req, res) {
+  const bkParam = req.query.bookmaker ? String(req.query.bookmaker).trim().toUpperCase() : "";
+  const bookmakerFilter = bkParam === "SPORTYBET_TZ" || bkParam === "BETPAWA_TZ" ? bkParam : void 0;
+  const tickets = automationStore.getTickets(bookmakerFilter);
   const cfg = automationStore.getFactoryConfig();
   const meta = automationStore.getTimestamps();
   const todayKey = getDateKeyInTimezone(Date.now(), cfg.timezone);
@@ -6440,9 +7682,15 @@ async function getPerformanceAnalytics(_req, res) {
   });
   res.json(summary);
 }
-async function getSchedulerStatus(_req, res) {
+async function getSchedulerStatus(req, res) {
+  const bkParam = req.query.bookmaker ? String(req.query.bookmaker).trim().toUpperCase() : "";
+  const bookmakerFilter = bkParam === "SPORTYBET_TZ" || bkParam === "BETPAWA_TZ" ? bkParam : void 0;
   res.json({
-    status: schedulerService.getStatus()
+    status: schedulerService.getStatus(bookmakerFilter),
+    feedStates: automationStore.getFeedStates(),
+    feedCycles: automationStore.getFeedCycles(bookmakerFilter).slice(0, 40),
+    matchResults: automationStore.getMatchResults(bookmakerFilter).slice(0, 120),
+    verificationFailures: automationStore.getVerificationFailures(bookmakerFilter)
   });
 }
 async function runCronDailyFactory(req, res) {
@@ -6488,10 +7736,16 @@ async function runCronTrackResults(req, res) {
   }
 }
 async function getDailyFactoryAdminState(_req, res) {
+  await schedulerService.ensureFirestoreHydrated();
+  const status = schedulerService.getStatus();
   res.json({
     config: automationStore.getFactoryConfig(),
-    status: schedulerService.getStatus(),
-    logs: automationStore.getLogs().slice(0, 80)
+    status,
+    feedStates: automationStore.getFeedStates(),
+    feedCycles: automationStore.getFeedCycles().slice(0, 60),
+    unfinishedMatches: status.unfinishedMatches || [],
+    verificationFailures: automationStore.getVerificationFailures(),
+    logs: automationStore.getLogs().slice(0, 100)
   });
 }
 async function updateDailyFactoryConfig(req, res) {
@@ -6580,13 +7834,21 @@ async function toggleFactoryAutomation(req, res) {
 }
 async function runDailyFactoryNow(req, res) {
   try {
-    const result = await schedulerService.runDailyFactoryJob(true, req.adminUser?.email || null);
+    const rawBk = req.body?.bookmaker ?? req.query.bookmaker;
+    const targetBookmaker = rawBk ? normalizeBookmakerId(rawBk) : void 0;
+    const result = await schedulerService.runDailyFactoryJob(
+      true,
+      req.adminUser?.email || null,
+      targetBookmaker
+    );
     res.json({
       ...result,
       newTickets: result.tickets,
       status: schedulerService.getStatus(),
+      feedStates: automationStore.getFeedStates(),
+      feedCycles: automationStore.getFeedCycles().slice(0, 60),
       tickets: automationStore.getTickets(),
-      logs: automationStore.getLogs().slice(0, 80)
+      logs: automationStore.getLogs().slice(0, 100)
     });
   } catch (err) {
     handleError(res, err, "DAILY_FACTORY_RUN_FAILED");
@@ -6681,19 +7943,45 @@ async function retryFailedBookingCodesHandler(req, res) {
 async function trackTicketsResults(req, res) {
   try {
     const ticketIds = Array.isArray(req.body?.ticketIds) ? req.body.ticketIds : void 0;
+    const rawBk = req.body?.bookmaker ?? req.query.bookmaker;
+    const targetBookmaker = rawBk ? normalizeBookmakerId(rawBk) : void 0;
+    const retryFailedOnly = Boolean(req.body?.retryFailedOnly);
     const result = await schedulerService.runResultsTrackingJob(
       true,
       ticketIds,
+      req.adminUser?.email || null,
+      { targetBookmaker, retryFailedOnly }
+    );
+    res.json({
+      ...result,
+      status: schedulerService.getStatus(),
+      feedStates: automationStore.getFeedStates(),
+      feedCycles: automationStore.getFeedCycles().slice(0, 60),
+      tickets: automationStore.getTickets(),
+      logs: automationStore.getLogs().slice(0, 100)
+    });
+  } catch (err) {
+    handleError(res, err, "TRACK_RESULTS_FAILED");
+  }
+}
+async function retryFailedResultChecksHandler(req, res) {
+  try {
+    const rawBk = req.body?.bookmaker ?? req.query.bookmaker;
+    const targetBookmaker = rawBk ? normalizeBookmakerId(rawBk) : void 0;
+    const result = await schedulerService.retryFailedResultChecks(
+      targetBookmaker,
       req.adminUser?.email || null
     );
     res.json({
       ...result,
       status: schedulerService.getStatus(),
+      feedStates: automationStore.getFeedStates(),
+      feedCycles: automationStore.getFeedCycles().slice(0, 60),
       tickets: automationStore.getTickets(),
-      logs: automationStore.getLogs().slice(0, 80)
+      logs: automationStore.getLogs().slice(0, 100)
     });
   } catch (err) {
-    handleError(res, err, "TRACK_RESULTS_FAILED");
+    handleError(res, err, "RETRY_RESULTS_FAILED");
   }
 }
 async function hydrateTicketsHandler(req, res) {
@@ -6701,13 +7989,18 @@ async function hydrateTicketsHandler(req, res) {
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid Firebase ticket hydration payload." });
   }
-  const hydratedCount = automationStore.hydrateTickets(
-    parsed.data.tickets
-  );
+  const hydratedCount = automationStore.hydrateFromExternal({
+    tickets: parsed.data.tickets,
+    cycles: parsed.data.cycles,
+    feedStates: parsed.data.feedStates,
+    matchResults: parsed.data.matchResults
+  });
   res.json({
     hydratedCount,
     totalTickets: automationStore.getTickets().length,
-    status: schedulerService.getStatus()
+    status: schedulerService.getStatus(),
+    feedStates: automationStore.getFeedStates(),
+    feedCycles: automationStore.getFeedCycles().slice(0, 60)
   });
 }
 async function getAdminOverview(_req, res) {
@@ -6883,6 +8176,7 @@ apiRouter.post(
 apiRouter.post("/tickets/retry-booking-codes", requireAdmin, retryFailedBookingCodesHandler);
 apiRouter.post("/tickets/hydrate", requireAdmin, hydrateTicketsHandler);
 apiRouter.post("/tickets/track-results", requireAdmin, trackTicketsResults);
+apiRouter.post("/tickets/retry-results", requireAdmin, retryFailedResultChecksHandler);
 apiRouter.post("/scheduler/results-run", requireAdmin, trackTicketsResults);
 apiRouter.get("/admin/overview", requireAdmin, getAdminOverview);
 apiRouter.put("/admin/platform-settings", requireAdmin, updatePlatformSettings);

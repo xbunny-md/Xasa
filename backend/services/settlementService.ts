@@ -1,8 +1,13 @@
 import type {
+  BookmakerCycleLockEvaluation,
+  BookmakerId,
+  CycleUnfinishedMatchInfo,
   GeneratedTicket,
+  GenerationCycle,
   NormalizedMatch,
   PerformanceAnalyticsSummary,
   PerformanceBreakdownRow,
+  ResultVerificationFailure,
   SelectionSettlementRecord,
   SelectionSettlementStatus,
   TicketSelectionRecord,
@@ -12,6 +17,14 @@ import type {
 export interface ParsedScore {
   homeGoals: number;
   awayGoals: number;
+}
+
+export function isSelectionTerminalStatus(status: SelectionSettlementStatus | string | undefined): boolean {
+  return status === 'WON' || status === 'LOST' || status === 'VOID';
+}
+
+export function isTicketTerminalStatus(status: TicketStatus | string | undefined): boolean {
+  return status === 'WON' || status === 'LOST' || status === 'VOID';
 }
 
 export function parseScoreString(score: string | null | undefined): ParsedScore | null {
@@ -25,10 +38,25 @@ export function parseScoreString(score: string | null | undefined): ParsedScore 
   return { homeGoals, awayGoals };
 }
 
+export function isMatchOfficiallyVoided(matchStatus: string, statusCode: number): boolean {
+  if (statusCode === 5 || statusCode === 7) return true;
+  return /\b(cancelled|canceled|abandoned|walkover|void|voided)\b/i.test(matchStatus || '');
+}
+
+export function isMatchPostponed(matchStatus: string, statusCode: number): boolean {
+  if (statusCode === 6) return true;
+  return /\b(postponed|interrupted|delayed|rescheduled)\b/i.test(matchStatus || '');
+}
+
+export function isMatchSuspended(matchStatus: string): boolean {
+  return /\bsuspended\b/i.test(matchStatus || '');
+}
+
 export function isMatchPostponedOrCancelled(matchStatus: string, statusCode: number): boolean {
-  if (statusCode === 5 || statusCode === 6 || statusCode === 7) return true;
-  return /\b(postponed|cancelled|canceled|abandoned|suspended|walkover|interrupted)\b/i.test(
-    matchStatus || ''
+  return (
+    isMatchOfficiallyVoided(matchStatus, statusCode) ||
+    isMatchPostponed(matchStatus, statusCode) ||
+    isMatchSuspended(matchStatus)
   );
 }
 
@@ -287,6 +315,191 @@ export function settleSingleSelectionOutcome(
   };
 }
 
+export function computeTicketMatchProgress(
+  ticket: Pick<GeneratedTicket, 'selections' | 'selectionSettlements'>
+): {
+  totalMatchCount: number;
+  settledMatchCount: number;
+  unfinishedMatchCount: number;
+} {
+  const totalMatchCount = ticket.selections.length;
+  let settledMatchCount = 0;
+  for (const sel of ticket.selections) {
+    const record = ticket.selectionSettlements.find((s) => s.selectionKey === sel.selectionKey);
+    if (record && isSelectionTerminalStatus(record.status)) {
+      settledMatchCount++;
+    }
+  }
+  return {
+    totalMatchCount,
+    settledMatchCount,
+    unfinishedMatchCount: Math.max(0, totalMatchCount - settledMatchCount),
+  };
+}
+
+function evaluateSingleSelectionFromLookup(
+  sel: TicketSelectionRecord,
+  existingSel: SelectionSettlementRecord | undefined,
+  matchLookup: Map<string, NormalizedMatch | null>,
+  nowMs: number,
+  checkedAt: string
+): SelectionSettlementRecord {
+  // Keep terminal selection status if already verified & determined
+  if (existingSel && isSelectionTerminalStatus(existingSel.status)) {
+    return existingSel;
+  }
+
+  const match = matchLookup.get(sel.eventId) ?? null;
+
+  if (!match) {
+    const beforeKickoff = sel.estimateStartTime > 0 && nowMs < sel.estimateStartTime;
+    const pastGrace = sel.estimateStartTime > 0 && nowMs > sel.estimateStartTime + 3 * 3600000;
+    const preservedPostponed =
+      existingSel?.status === 'POSTPONED' || existingSel?.status === 'SUSPENDED'
+        ? existingSel.status
+        : null;
+    const fallbackStatus: SelectionSettlementStatus = preservedPostponed
+      ? preservedPostponed
+      : pastGrace
+        ? 'UNVERIFIED'
+        : beforeKickoff
+          ? 'UPCOMING'
+          : 'PENDING';
+
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: fallbackStatus,
+      officialMatchStatus: existingSel?.officialMatchStatus || sel.matchStatus,
+      score: existingSel?.score || null,
+      playedSeconds: existingSel?.playedSeconds || null,
+      currentOdds: existingSel?.currentOdds ?? sel.odds,
+      oddsChanged: false,
+      reason:
+        fallbackStatus === 'UNVERIFIED'
+          ? 'Official final score unavailable after match window — marked UNVERIFIED (never treated as WON/LOST).'
+          : fallbackStatus === 'POSTPONED' || fallbackStatus === 'SUSPENDED'
+            ? `Match ${fallbackStatus.toLowerCase()} — waiting for official completion or void`
+            : fallbackStatus === 'UPCOMING'
+              ? 'Scheduled upcoming kickoff'
+              : 'Awaiting official result / feed update',
+      checkedAt,
+    };
+  }
+
+  const liveOdds =
+    match.markets
+      .find((m) => m.marketId === sel.marketId && (m.specifier || '') === (sel.specifier || ''))
+      ?.outcomes.find((o) => o.outcomeId === sel.outcomeId)?.odds ?? null;
+  const oddsChanged = liveOdds !== null && Math.abs(liveOdds - sel.odds) >= 0.01;
+
+  if (isMatchOfficiallyVoided(match.matchStatus, match.statusCode)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: 'VOID',
+      officialMatchStatus: match.matchStatus,
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `Match ${match.matchStatus || 'Cancelled/Void'} — leg officially voided at 1.00`,
+      checkedAt,
+    };
+  }
+
+  if (isMatchPostponed(match.matchStatus, match.statusCode)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: 'POSTPONED',
+      officialMatchStatus: match.matchStatus || 'Postponed',
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `Match postponed (${match.matchStatus}) — awaiting completion or official void`,
+      checkedAt,
+    };
+  }
+
+  if (isMatchSuspended(match.matchStatus)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: 'SUSPENDED',
+      officialMatchStatus: match.matchStatus || 'Suspended',
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `Match suspended (${match.matchStatus}) — awaiting resumption or official settlement`,
+      checkedAt,
+    };
+  }
+
+  if (isMatchEnded(match.matchStatus, match.statusCode)) {
+    const parsedScore = parseScoreString(match.score);
+    if (!parsedScore) {
+      return {
+        selectionKey: sel.selectionKey,
+        eventId: sel.eventId,
+        status: 'UNVERIFIED',
+        officialMatchStatus: match.matchStatus,
+        score: match.score,
+        playedSeconds: match.playedSeconds,
+        currentOdds: liveOdds,
+        oddsChanged,
+        reason: 'Match ended without verifiable final score — marked UNVERIFIED.',
+        checkedAt,
+      };
+    }
+    const outcomeRes = settleSingleSelectionOutcome(sel, parsedScore);
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: outcomeRes.status,
+      officialMatchStatus: match.matchStatus,
+      score: match.score,
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: outcomeRes.reason,
+      checkedAt,
+    };
+  }
+
+  if (isMatchLiveStatus(match)) {
+    return {
+      selectionKey: sel.selectionKey,
+      eventId: sel.eventId,
+      status: 'LIVE',
+      officialMatchStatus: match.matchStatus,
+      score: match.score || '0:0',
+      playedSeconds: match.playedSeconds,
+      currentOdds: liveOdds,
+      oddsChanged,
+      reason: `In-Play (${match.matchStatus}${match.playedSeconds ? ` ${match.playedSeconds}'` : ''})`,
+      checkedAt,
+    };
+  }
+
+  const upcomingBeforeKickoff =
+    (match.estimateStartTime || sel.estimateStartTime) > nowMs;
+  return {
+    selectionKey: sel.selectionKey,
+    eventId: sel.eventId,
+    status: upcomingBeforeKickoff ? 'UPCOMING' : 'PENDING',
+    officialMatchStatus: match.matchStatus,
+    score: match.score,
+    playedSeconds: match.playedSeconds,
+    currentOdds: liveOdds,
+    oddsChanged,
+    reason: upcomingBeforeKickoff ? 'Scheduled upcoming kickoff' : 'Awaiting kickoff / official update',
+    checkedAt,
+  };
+}
+
 export function evaluateTicketSettlement(
   ticket: GeneratedTicket,
   matchLookup: Map<string, NormalizedMatch | null>,
@@ -294,139 +507,71 @@ export function evaluateTicketSettlement(
 ): GeneratedTicket {
   const checkedAt = new Date(nowMs).toISOString();
 
-  // Do not overwrite terminal settled tickets (WON / LOST / VOID)
-  if (ticket.status === 'WON' || ticket.status === 'LOST' || ticket.status === 'VOID') {
-    return ticket;
+  // WON and VOID tickets are completely final and immutable
+  if (ticket.status === 'WON' || ticket.status === 'VOID') {
+    const progress = computeTicketMatchProgress(ticket);
+    return {
+      ...ticket,
+      ...progress,
+    };
+  }
+
+  // LOST accumulator status & odds remain permanently LOST, but any remaining non-terminal legs
+  // keep tracking until every match finishes so the cycle generation lock knows when all matches end.
+  if (ticket.status === 'LOST') {
+    const currentProgress = computeTicketMatchProgress(ticket);
+    if (currentProgress.unfinishedMatchCount === 0) {
+      return {
+        ...ticket,
+        ...currentProgress,
+      };
+    }
+
+    const updatedRemainingSettlements = ticket.selections.map((sel) => {
+      const existingSel = ticket.selectionSettlements.find(
+        (s) => s.selectionKey === sel.selectionKey
+      );
+      if (existingSel && isSelectionTerminalStatus(existingSel.status)) {
+        return existingSel;
+      }
+      return evaluateSingleSelectionFromLookup(sel, existingSel, matchLookup, nowMs, checkedAt);
+    });
+
+    const nextProgress = computeTicketMatchProgress({
+      selections: ticket.selections,
+      selectionSettlements: updatedRemainingSettlements,
+    });
+
+    return {
+      ...ticket,
+      selectionSettlements: updatedRemainingSettlements,
+      ...nextProgress,
+      lastCheckedAt: checkedAt,
+    };
   }
 
   const nextSettlements: SelectionSettlementRecord[] = ticket.selections.map((sel) => {
     const existingSel = ticket.selectionSettlements.find(
       (s) => s.selectionKey === sel.selectionKey
     );
-
-    // Keep terminal selection status if already determined
-    if (
-      existingSel &&
-      (existingSel.status === 'WON' ||
-        existingSel.status === 'LOST' ||
-        existingSel.status === 'VOID')
-    ) {
-      return existingSel;
-    }
-
-    const match = matchLookup.get(sel.eventId) ?? null;
-
-    if (!match) {
-      // Missing from feed: if still before kickoff + 3h, PENDING; otherwise UNVERIFIED (never LOST)
-      const pastGrace = sel.estimateStartTime > 0 && nowMs > sel.estimateStartTime + 3 * 3600000;
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: pastGrace ? 'UNVERIFIED' : 'PENDING',
-        officialMatchStatus: existingSel?.officialMatchStatus || sel.matchStatus,
-        score: existingSel?.score || null,
-        playedSeconds: existingSel?.playedSeconds || null,
-        currentOdds: existingSel?.currentOdds ?? sel.odds,
-        oddsChanged: false,
-        reason: pastGrace
-          ? 'Official final score unavailable after match window — marked UNVERIFIED (never treated as loss).'
-          : 'Awaiting kickoff / feed update',
-        checkedAt,
-      };
-    }
-
-    const liveOdds =
-      match.markets
-        .find((m) => m.marketId === sel.marketId && (m.specifier || '') === (sel.specifier || ''))
-        ?.outcomes.find((o) => o.outcomeId === sel.outcomeId)?.odds ?? null;
-    const oddsChanged = liveOdds !== null && Math.abs(liveOdds - sel.odds) >= 0.01;
-
-    if (isMatchPostponedOrCancelled(match.matchStatus, match.statusCode)) {
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: 'VOID',
-        officialMatchStatus: match.matchStatus,
-        score: match.score,
-        playedSeconds: match.playedSeconds,
-        currentOdds: liveOdds,
-        oddsChanged,
-        reason: `Match ${match.matchStatus} — leg voided at 1.00`,
-        checkedAt,
-      };
-    }
-
-    if (isMatchEnded(match.matchStatus, match.statusCode)) {
-      const parsedScore = parseScoreString(match.score);
-      if (!parsedScore) {
-        return {
-          selectionKey: sel.selectionKey,
-          eventId: sel.eventId,
-          status: 'UNVERIFIED',
-          officialMatchStatus: match.matchStatus,
-          score: match.score,
-          playedSeconds: match.playedSeconds,
-          currentOdds: liveOdds,
-          oddsChanged,
-          reason: 'Match ended without verifiable final score — marked UNVERIFIED.',
-          checkedAt,
-        };
-      }
-      const outcomeRes = settleSingleSelectionOutcome(sel, parsedScore);
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: outcomeRes.status,
-        officialMatchStatus: match.matchStatus,
-        score: match.score,
-        playedSeconds: match.playedSeconds,
-        currentOdds: liveOdds,
-        oddsChanged,
-        reason: outcomeRes.reason,
-        checkedAt,
-      };
-    }
-
-    if (isMatchLiveStatus(match)) {
-      return {
-        selectionKey: sel.selectionKey,
-        eventId: sel.eventId,
-        status: 'LIVE',
-        officialMatchStatus: match.matchStatus,
-        score: match.score || '0:0',
-        playedSeconds: match.playedSeconds,
-        currentOdds: liveOdds,
-        oddsChanged,
-        reason: `In-Play (${match.matchStatus}${match.playedSeconds ? ` ${match.playedSeconds}'` : ''})`,
-        checkedAt,
-      };
-    }
-
-    return {
-      selectionKey: sel.selectionKey,
-      eventId: sel.eventId,
-      status: 'PENDING',
-      officialMatchStatus: match.matchStatus,
-      score: match.score,
-      playedSeconds: match.playedSeconds,
-      currentOdds: liveOdds,
-      oddsChanged,
-      reason: 'Scheduled upcoming kickoff',
-      checkedAt,
-    };
+    return evaluateSingleSelectionFromLookup(sel, existingSel, matchLookup, nowMs, checkedAt);
   });
 
   // Compute accumulator-level status & effective combined odds
   const hasLost = nextSettlements.some((s) => s.status === 'LOST');
   const allVoid = nextSettlements.length > 0 && nextSettlements.every((s) => s.status === 'VOID');
-  const allTerminal = nextSettlements.every(
-    (s) => s.status === 'WON' || s.status === 'LOST' || s.status === 'VOID'
-  );
+  const allTerminal = nextSettlements.every((s) => isSelectionTerminalStatus(s.status));
   const hasWon = nextSettlements.some((s) => s.status === 'WON');
   const hasVoid = nextSettlements.some((s) => s.status === 'VOID');
   const hasUnverified = nextSettlements.some((s) => s.status === 'UNVERIFIED');
   const hasLive = nextSettlements.some((s) => s.status === 'LIVE');
-  const hasPending = nextSettlements.some((s) => s.status === 'PENDING');
+  const hasWaitingMatch = nextSettlements.some(
+    (s) =>
+      s.status === 'UPCOMING' ||
+      s.status === 'PENDING' ||
+      s.status === 'POSTPONED' ||
+      s.status === 'SUSPENDED'
+  );
 
   // Recalculate effective combined odds (voided legs reduce multiplier to 1.00)
   let effectiveCombinedOdds = 1;
@@ -456,7 +601,7 @@ export function evaluateTicketSettlement(
     settledAt = checkedAt;
   } else if (hasUnverified) {
     ticketStatus = 'UNVERIFIED';
-  } else if ((hasWon || hasVoid) && (hasPending || hasLive)) {
+  } else if ((hasWon || hasVoid) && (hasWaitingMatch || hasLive)) {
     ticketStatus = 'PARTIALLY_SETTLED';
   } else if (hasLive) {
     ticketStatus = 'LIVE';
@@ -464,13 +609,137 @@ export function evaluateTicketSettlement(
     ticketStatus = 'PENDING';
   }
 
+  const progress = computeTicketMatchProgress({
+    selections: ticket.selections,
+    selectionSettlements: nextSettlements,
+  });
+
   return {
     ...ticket,
     status: ticketStatus,
     effectiveCombinedOdds,
     selectionSettlements: nextSettlements,
+    ...progress,
     settledAt,
     lastCheckedAt: checkedAt,
+  };
+}
+
+/**
+ * NON-NEGOTIABLE GENERATION LOCK RULE:
+ * A bookmaker's generation cycle stays LOCKED until EVERY selection in EVERY ticket
+ * of that bookmaker's current active cycle has reached a verified terminal state (WON / LOST / VOID)
+ * AND every ticket is settled AND there are no unverified results or verification failures.
+ */
+export function evaluateBookmakerCycleLock(params: {
+  bookmakerId: BookmakerId;
+  activeCycle: GenerationCycle | null;
+  cycleTickets: GeneratedTicket[];
+  verificationFailures?: ResultVerificationFailure[];
+}): BookmakerCycleLockEvaluation {
+  const { bookmakerId, activeCycle, cycleTickets, verificationFailures = [] } = params;
+  const cycleId = activeCycle?.cycleId || cycleTickets[0]?.cycleId || null;
+
+  const unfinishedMatches: CycleUnfinishedMatchInfo[] = [];
+  const unsettledTicketIds: string[] = [];
+  let totalMatchesInCycle = 0;
+  let finishedMatchesCount = 0;
+  let unverifiedMatchesCount = 0;
+  let settledTicketsInCycle = 0;
+
+  for (const ticket of cycleTickets) {
+    const ticketHasTerminalStatus = isTicketTerminalStatus(ticket.status);
+    let ticketHasUnfinishedLeg = false;
+
+    for (const sel of ticket.selections) {
+      totalMatchesInCycle++;
+      const settlement = ticket.selectionSettlements.find(
+        (s) => s.selectionKey === sel.selectionKey
+      );
+      const st: SelectionSettlementStatus = settlement?.status || 'UPCOMING';
+
+      if (isSelectionTerminalStatus(st)) {
+        finishedMatchesCount++;
+      } else {
+        ticketHasUnfinishedLeg = true;
+        if (st === 'UNVERIFIED') {
+          unverifiedMatchesCount++;
+        }
+        unfinishedMatches.push({
+          bookmakerId,
+          cycleId: cycleId || ticket.cycleId || 'LEGACY_CYCLE',
+          ticketId: ticket.internalTicketId,
+          eventId: sel.eventId,
+          selectionKey: sel.selectionKey,
+          homeTeam: sel.homeTeam,
+          awayTeam: sel.awayTeam,
+          kickoffMs: sel.estimateStartTime,
+          status: st,
+          reason: settlement?.reason || 'Awaiting verified final match result',
+        });
+      }
+    }
+
+    if (ticketHasTerminalStatus && !ticketHasUnfinishedLeg) {
+      settledTicketsInCycle++;
+    } else {
+      unsettledTicketIds.push(ticket.internalTicketId);
+    }
+  }
+
+  const cycleEventIds = new Set(cycleTickets.flatMap((t) => t.selections.map((s) => s.eventId)));
+  const relevantFailures = verificationFailures.filter(
+    (f) => f.bookmakerId === bookmakerId && (cycleEventIds.size === 0 || cycleEventIds.has(f.eventId))
+  );
+
+  const unfinishedMatchesCount = unfinishedMatches.length;
+  const unsettledTicketsCount = unsettledTicketIds.length;
+  const totalTicketsInCycle = cycleTickets.length;
+
+  const hasActiveContent = Boolean(activeCycle && activeCycle.status === 'ACTIVE') || totalTicketsInCycle > 0;
+  const generationLocked =
+    hasActiveContent &&
+    (unfinishedMatchesCount > 0 ||
+      unsettledTicketsCount > 0 ||
+      unverifiedMatchesCount > 0 ||
+      relevantFailures.length > 0);
+
+  let lockReason = 'All matches in previous cycle settled — eligible for new daily feed generation.';
+  if (totalTicketsInCycle === 0 && !activeCycle) {
+    lockReason = 'No active cycle yet — unlocked for initial permanent feed generation.';
+  } else if (generationLocked) {
+    const parts: string[] = [];
+    if (unfinishedMatchesCount > 0) {
+      parts.push(`${unfinishedMatchesCount} unfinished match selection(s)`);
+    }
+    if (unverifiedMatchesCount > 0) {
+      parts.push(`${unverifiedMatchesCount} unverified result(s)`);
+    }
+    if (relevantFailures.length > 0) {
+      parts.push(`${relevantFailures.length} result verification failure(s)`);
+    }
+    if (unsettledTicketsCount > 0) {
+      parts.push(`${unsettledTicketsCount} unsettled ticket(s)`);
+    }
+    lockReason = `LOCKED: Waiting for ${parts.join(', ')} in cycle ${cycleId || 'current'} before generating a new daily feed.`;
+  }
+
+  return {
+    bookmakerId,
+    activeCycleId: cycleId,
+    generationLocked,
+    lockStatus: generationLocked ? 'LOCKED' : 'UNLOCKED',
+    lockReason,
+    totalTicketsInCycle,
+    settledTicketsInCycle,
+    unsettledTicketsCount,
+    totalMatchesInCycle,
+    finishedMatchesCount,
+    unfinishedMatchesCount,
+    unverifiedMatchesCount,
+    verificationFailuresCount: relevantFailures.length,
+    unfinishedMatches,
+    unsettledTicketIds,
   };
 }
 

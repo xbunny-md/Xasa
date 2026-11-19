@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   ArrowLeftRight,
   Check,
+  Clock,
   Database,
+  Lock,
   Pause,
   Play,
   Plus,
@@ -13,6 +16,7 @@ import {
   ShieldCheck,
   Square,
   Trash2,
+  Unlock,
   Users,
   Zap,
 } from 'lucide-react';
@@ -35,7 +39,7 @@ import type {
 import { isDisallowedDailyFeedMarket } from '../utils/dailyFeedFilter.ts';
 import { formatDateTimeCompact } from '../utils/formatters.ts';
 
-type AdminTab = 'factory' | 'integrations' | 'transfers' | 'users' | 'logs';
+type AdminTab = 'factory' | 'monitor' | 'integrations' | 'transfers' | 'users' | 'logs';
 
 export function AdminControlCenterPage() {
   const { user, isAdmin, cloudAdminLogs, getIdToken } = useFirebase();
@@ -46,14 +50,20 @@ export function AdminControlCenterPage() {
     schedulerStatus,
     automationLogs,
     portfolioTickets,
+    feedStates,
+    feedCycles,
+    unfinishedMatches,
+    verificationFailures,
     runningFactory,
     trackingResults,
     retryingCodes,
+    retryingResults,
     loadAdminFactoryState,
     saveFactoryConfig,
     toggleAutomation,
     runFactoryNow,
     trackAllResultsNow,
+    retryFailedResultChecks,
     retryFailedBookingCodes,
     deletePortfolioTicket,
     createBookingCodeForTicket,
@@ -271,6 +281,23 @@ export function AdminControlCenterPage() {
   }, [backendLogs, logCategoryFilter, logLevelFilter]);
 
   const failedCodeTickets = portfolioTickets.filter((t) => !t.shareCode);
+  const unsettledTickets = useMemo(
+    () =>
+      portfolioTickets.filter((t) => {
+        if (t.status !== 'WON' && t.status !== 'LOST' && t.status !== 'VOID') return true;
+        if (t.status === 'LOST') {
+          const settledCount =
+            t.settledMatchCount ??
+            t.selectionSettlements.filter(
+              (s) => s.status === 'WON' || s.status === 'LOST' || s.status === 'VOID'
+            ).length;
+          return settledCount < t.selections.length;
+        }
+        return false;
+      }),
+    [portfolioTickets]
+  );
+
   const draftBookmakerLabel =
     (draft.activeBookmaker || 'SPORTYBET_TZ') === 'BETPAWA_TZ' ? 'betPawa TZ' : 'SportyBet TZ';
 
@@ -291,42 +318,155 @@ export function AdminControlCenterPage() {
               Admin Control Center
             </h2>
             <p className="text-xs text-slate-600 dark:text-slate-400">
-              Manage Daily Factory automation, bookmaker integrations, cross-bookmaker transfers,
-              user permissions, and backend audit logs.
+              Monitor independent SportyBet &amp; betPawa cycle locks, unfinished matches,
+              settlement tracking, verification failures, and backend audit logs.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              disabled={runningFactory}
-              onClick={() => void runFactoryNow()}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-xs font-semibold text-white whitespace-nowrap"
+              disabled={runningFactory || feedStates.SPORTYBET_TZ.generationLocked}
+              title={
+                feedStates.SPORTYBET_TZ.generationLocked
+                  ? feedStates.SPORTYBET_TZ.lockReason
+                  : 'Generate permanent SportyBet TZ cycle'
+              }
+              onClick={() => void runFactoryNow('SPORTYBET_TZ')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-semibold text-white whitespace-nowrap"
             >
-              <Zap className={`w-3.5 h-3.5 ${runningFactory ? 'animate-pulse' : ''}`} />
-              <span>{runningFactory ? 'Running Factory...' : 'Manual Trigger Now'}</span>
+              {feedStates.SPORTYBET_TZ.generationLocked ? (
+                <Lock className="w-3.5 h-3.5" />
+              ) : (
+                <Zap className={`w-3.5 h-3.5 ${runningFactory ? 'animate-pulse' : ''}`} />
+              )}
+              <span>
+                {feedStates.SPORTYBET_TZ.generationLocked
+                  ? 'SportyBet Locked'
+                  : 'Generate SportyBet Feed'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={runningFactory || feedStates.BETPAWA_TZ.generationLocked}
+              title={
+                feedStates.BETPAWA_TZ.generationLocked
+                  ? feedStates.BETPAWA_TZ.lockReason
+                  : 'Generate permanent betPawa TZ cycle'
+              }
+              onClick={() => void runFactoryNow('BETPAWA_TZ')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-semibold text-white whitespace-nowrap"
+            >
+              {feedStates.BETPAWA_TZ.generationLocked ? (
+                <Lock className="w-3.5 h-3.5" />
+              ) : (
+                <Zap className={`w-3.5 h-3.5 ${runningFactory ? 'animate-pulse' : ''}`} />
+              )}
+              <span>
+                {feedStates.BETPAWA_TZ.generationLocked
+                  ? 'betPawa Locked'
+                  : 'Generate betPawa Feed'}
+              </span>
             </button>
 
             <button
               type="button"
               disabled={trackingResults}
               onClick={() => void trackAllResultsNow()}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white hover:bg-slate-50 border-slate-200 text-slate-700 dark:bg-[#111827] dark:hover:bg-[#1A2438] border dark:border-white/10 text-xs font-medium dark:text-slate-200 whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white hover:bg-slate-50 border-slate-200 text-slate-700 dark:bg-[#111827] dark:hover:bg-[#1A2438] border dark:border-white/10 text-xs font-medium dark:text-slate-200 whitespace-nowrap"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${trackingResults ? 'animate-spin' : ''}`} />
-              <span>Settle All Results</span>
+              <span>Check Results Now</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={retryingResults}
+              onClick={() => void retryFailedResultChecks()}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-amber-50 hover:bg-amber-100 border-amber-200 text-amber-800 dark:bg-amber-500/15 dark:hover:bg-amber-500/25 border dark:border-amber-500/35 text-xs font-medium dark:text-amber-200 whitespace-nowrap"
+            >
+              <AlertTriangle className={`w-3.5 h-3.5 ${retryingResults ? 'animate-spin' : ''}`} />
+              <span>Retry Failed Results ({verificationFailures.length})</span>
             </button>
 
             <button
               type="button"
               disabled={retryingCodes}
               onClick={() => void retryFailedBookingCodes()}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-50 hover:bg-emerald-100 border-emerald-200 text-emerald-700 dark:bg-emerald-600/20 dark:hover:bg-emerald-600/30 border dark:border-emerald-500/35 text-xs font-medium dark:text-emerald-200 whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-50 hover:bg-emerald-100 border-emerald-200 text-emerald-700 dark:bg-emerald-600/20 dark:hover:bg-emerald-600/30 border dark:border-emerald-500/35 text-xs font-medium dark:text-emerald-200 whitespace-nowrap"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${retryingCodes ? 'animate-spin' : ''}`} />
-              <span>Retry Failed Codes ({failedCodeTickets.length})</span>
+              <span>Retry Codes ({failedCodeTickets.length})</span>
             </button>
           </div>
+        </div>
+
+        {/* Independent Bookmaker Cycle Status Cards */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {(['SPORTYBET_TZ', 'BETPAWA_TZ'] as BookmakerId[]).map((bk) => {
+            const st = feedStates[bk];
+            return (
+              <div
+                key={bk}
+                className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] p-4 space-y-3 shadow-xs dark:shadow-none"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-slate-500 block">
+                      Independent Daily Feed
+                    </span>
+                    <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                      {st.bookmakerName}
+                    </h3>
+                  </div>
+                  <span
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border font-mono text-xs font-bold ${
+                      st.generationLocked
+                        ? 'bg-amber-50 border-amber-200 text-amber-800 dark:bg-amber-500/15 dark:border-amber-500/35 dark:text-amber-200'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-500/15 dark:border-emerald-500/35 dark:text-emerald-300'
+                    }`}
+                  >
+                    {st.generationLocked ? (
+                      <Lock className="w-3.5 h-3.5" />
+                    ) : (
+                      <Unlock className="w-3.5 h-3.5" />
+                    )}
+                    <span>{st.lockStatus}</span>
+                  </span>
+                </div>
+
+                <p className="text-xs text-slate-600 dark:text-slate-300">{st.lockReason}</p>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                  <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.06]">
+                    <span className="block text-[10px] text-slate-500">Active Cycle</span>
+                    <span className="font-mono font-semibold text-slate-900 dark:text-white truncate block">
+                      {st.activeCycleId || 'None'}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.06]">
+                    <span className="block text-[10px] text-slate-500">Matches Settled</span>
+                    <span className="font-mono font-semibold text-blue-700 dark:text-blue-300 tabular-nums">
+                      {st.finishedMatchesCount}/{st.totalMatchesInCycle}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.06]">
+                    <span className="block text-[10px] text-slate-500">Unsettled Tickets</span>
+                    <span className="font-mono font-semibold text-amber-700 dark:text-amber-300 tabular-nums">
+                      {st.unsettledTicketsCount}/{st.totalTicketsInCycle}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-[#090D16] border border-slate-200 dark:border-white/[0.06]">
+                    <span className="block text-[10px] text-slate-500">Result Failures</span>
+                    <span className="font-mono font-semibold text-rose-700 dark:text-rose-300 tabular-nums">
+                      {st.verificationFailuresCount + st.unverifiedMatchesCount}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
 
         {/* Admin Section Tabs */}
@@ -334,6 +474,11 @@ export function AdminControlCenterPage() {
           {(
             [
               { id: 'factory', label: 'Daily Factory', icon: ShieldCheck },
+              {
+                id: 'monitor',
+                label: `Cycle Monitor (${unfinishedMatches.length} pending)`,
+                icon: Clock,
+              },
               { id: 'integrations', label: 'Integrations & Markets', icon: Database },
               { id: 'transfers', label: `Transfers (${transferHistory.length})`, icon: ArrowLeftRight },
               { id: 'users', label: `Users & Roles (${managedUsers.length})`, icon: Users },
@@ -687,7 +832,7 @@ export function AdminControlCenterPage() {
                     }
                     className="rounded border-slate-300 dark:border-white/20 bg-white dark:bg-[#090D16]"
                   />
-                  <span>Auto-Create Replacement Code When Upcoming Code Settles (WON/LOST/VOID)</span>
+                  <span>Strict Cycle Lock (Auto-Unlock Next Feed Only After All Matches Settle)</span>
                 </label>
                 <label className="inline-flex items-center gap-2 text-slate-700 dark:text-slate-200 cursor-pointer">
                   <input
@@ -956,7 +1101,187 @@ export function AdminControlCenterPage() {
           </div>
         )}
 
-        {/* TAB 2: INTEGRATIONS & TRANSFER MARKETS */}
+        {/* TAB 2: CYCLE LOCKS, UNFINISHED MATCHES & VERIFICATION FAILURES MONITOR */}
+        {activeTab === 'monitor' && (
+          <div className="space-y-6">
+            {/* Generation Cycles History */}
+            <section className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] overflow-hidden shadow-xs dark:shadow-none">
+              <div className="px-5 py-4 border-b border-slate-200 dark:border-white/[0.08] flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                    Permanent Generation Cycles ({feedCycles.length})
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Immutable history of SportyBet TZ and betPawa TZ daily feed cycles stored in
+                    Firebase.
+                  </p>
+                </div>
+              </div>
+              {feedCycles.length === 0 ? (
+                <div className="p-6 text-xs text-slate-500 text-center">
+                  No permanent generation cycles recorded yet.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 dark:bg-[#0B101B] text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-white/[0.06]">
+                      <tr>
+                        <th className="px-4 py-2.5 font-medium">Cycle ID</th>
+                        <th className="px-4 py-2.5 font-medium">Bookmaker</th>
+                        <th className="px-4 py-2.5 font-medium">Status</th>
+                        <th className="px-4 py-2.5 font-medium">Matches</th>
+                        <th className="px-4 py-2.5 font-medium">Tickets (W/L/V)</th>
+                        <th className="px-4 py-2.5 font-medium">Settled At</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-white/[0.06]">
+                      {feedCycles.map((c) => (
+                        <tr key={c.cycleId}>
+                          <td className="px-4 py-2.5 font-mono font-semibold text-slate-900 dark:text-white">
+                            {c.cycleId}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            {c.bookmakerId === 'BETPAWA_TZ' ? 'betPawa TZ' : 'SportyBet TZ'}
+                          </td>
+                          <td className="px-4 py-2.5 font-mono">
+                            <span
+                              className={
+                                c.status === 'SETTLED'
+                                  ? 'text-emerald-700 dark:text-emerald-300 font-semibold'
+                                  : 'text-amber-700 dark:text-amber-300 font-semibold'
+                              }
+                            >
+                              {c.status}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2.5 font-mono tabular-nums">
+                            {c.finishedMatches}/{c.totalMatches} finished
+                          </td>
+                          <td className="px-4 py-2.5 font-mono tabular-nums">
+                            {c.ticketCount} ({c.wonTickets}W / {c.lostTickets}L / {c.voidTickets}V)
+                          </td>
+                          <td className="px-4 py-2.5 font-mono text-slate-500">
+                            {c.settledAt ? formatDateTimeCompact(c.settledAt) : 'In Progress'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+
+            {/* Unfinished Matches & Unsettled Tickets */}
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] overflow-hidden shadow-xs dark:shadow-none">
+                <div className="px-4 py-3 border-b border-slate-200 dark:border-white/[0.07]">
+                  <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                    Unfinished Matches Holding Cycle Locks ({unfinishedMatches.length})
+                  </h3>
+                </div>
+                <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 dark:divide-white/[0.05]">
+                  {unfinishedMatches.length === 0 ? (
+                    <div className="p-6 text-xs text-slate-500 text-center">
+                      All active matches have finished and settled.
+                    </div>
+                  ) : (
+                    unfinishedMatches.slice(0, 60).map((m) => (
+                      <div key={`${m.ticketId}:${m.selectionKey}`} className="px-4 py-3 text-xs space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-900 dark:text-white">
+                            {m.homeTeam} vs {m.awayTeam}
+                          </span>
+                          <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-500/30">
+                            {m.status}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {m.bookmakerId === 'BETPAWA_TZ' ? 'betPawa TZ' : 'SportyBet TZ'} ·{' '}
+                          <button
+                            type="button"
+                            onClick={() => openTicketDetails(m.ticketId)}
+                            className="font-mono text-blue-700 dark:text-blue-300 hover:underline"
+                          >
+                            {m.ticketId}
+                          </button>{' '}
+                          · Kickoff {formatDateTimeCompact(m.kickoffMs)}
+                        </div>
+                        <div className="text-[11px] text-slate-500">{m.reason}</div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] overflow-hidden shadow-xs dark:shadow-none">
+                <div className="px-4 py-3 border-b border-slate-200 dark:border-white/[0.07] flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                    Verification Failures ({verificationFailures.length}) &amp; Unsettled Tickets (
+                    {unsettledTickets.length})
+                  </h3>
+                  <button
+                    type="button"
+                    disabled={retryingResults}
+                    onClick={() => void retryFailedResultChecks()}
+                    className="px-2.5 py-1 rounded bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-800 dark:bg-amber-500/15 dark:border-amber-500/35 dark:text-amber-200 text-[11px] font-medium"
+                  >
+                    {retryingResults ? 'Retrying...' : 'Retry Failed'}
+                  </button>
+                </div>
+                <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 dark:divide-white/[0.05]">
+                  {verificationFailures.map((f) => (
+                    <div key={f.failureId} className="px-4 py-3 text-xs space-y-1 bg-rose-50/40 dark:bg-rose-500/5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-rose-800 dark:text-rose-200">
+                          {f.homeTeam} vs {f.awayTeam} ({f.attempts} attempts)
+                        </span>
+                        <span className="font-mono text-[10px] text-rose-600 dark:text-rose-300">
+                          {f.bookmakerId === 'BETPAWA_TZ' ? 'betPawa TZ' : 'SportyBet TZ'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-rose-700 dark:text-rose-300">{f.error}</p>
+                    </div>
+                  ))}
+                  {unsettledTickets.slice(0, 40).map((t) => (
+                    <div
+                      key={t.internalTicketId}
+                      className="px-4 py-3 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => openTicketDetails(t.internalTicketId)}
+                        className="text-left min-w-0 hover:text-blue-700 dark:hover:text-blue-300"
+                      >
+                        <div className="font-mono font-semibold text-slate-900 dark:text-white truncate">
+                          {t.internalTicketId} · {t.status}
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {t.bookmakerId === 'BETPAWA_TZ' ? 'betPawa TZ' : 'SportyBet TZ'} ·{' '}
+                          {t.settledMatchCount ?? 0}/{t.selections.length} matches settled
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={trackingResults}
+                        onClick={() => void trackAllResultsNow([t.internalTicketId])}
+                        className="px-2 py-1 rounded border border-slate-200 dark:border-white/10 text-[10px] font-medium text-slate-700 dark:text-slate-200 shrink-0"
+                      >
+                        Recheck
+                      </button>
+                    </div>
+                  ))}
+                  {verificationFailures.length === 0 && unsettledTickets.length === 0 && (
+                    <div className="p-6 text-xs text-slate-500 text-center">
+                      No unsettled tickets or verification failures.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* TAB 3: INTEGRATIONS & TRANSFER MARKETS */}
         {activeTab === 'integrations' && (
           <div className="space-y-6">
             <section className="rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-white/[0.08] p-6 space-y-5 shadow-xs dark:shadow-none">
